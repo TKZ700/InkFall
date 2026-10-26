@@ -1,0 +1,40 @@
+[project]
+name = "inkfall"
+version = "0.1.0"
+description = "Inkfall - a PDF reader and ink annotation notebook"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "PyMuPDF",
+  "PySide6",
+  "numpy",
+]
+
+[project.scripts]
+inkfall = "main:main"
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-qt",
+]
+# Optional, local/CI only. Normal development and runtime never need Nuitka.
+build = [
+  "nuitka==4.3.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "core", "document", "library", "rendering", "annotations", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
+faulthandler_timeout = 120
+
+[tool.uv]
+package = true

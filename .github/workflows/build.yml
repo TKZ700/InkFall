@@ -1,0 +1,161 @@
+name: Build preview artifacts
+
+# Builds the two Inkfall 0.1.0 preview artifacts on native runners:
+#   * Windows x64 NSIS setup installer
+#   * Linux x86_64 standalone .tar.gz
+#
+# Manual runs upload both files as workflow artifacts (not a GitHub
+# Release). Pull requests and branch pushes build and smoke-test only.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [master]
+
+# Least privilege: the workflow reads the repository and uploads
+# ephemeral artifacts. It never writes contents, packages or releases.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-artifacts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_LINK_MODE: copy
+
+jobs:
+  windows-installer:
+    name: Windows x64 installer
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies (runtime + build group)
+        run: uv sync --locked --group build
+
+      - name: Check build configuration and assets
+        run: uv run pytest tests/test_build_config.py tests/test_build_icons.py tests/test_vazirmatn_font.py tests/test_preview_backgrounds.py -q
+
+      - name: Resolve artifact name
+        id: meta
+        shell: pwsh
+        run: |
+          $name = uv run python -c "from scripts.build_config import project_version, windows_installer_name; print(windows_installer_name(project_version()))"
+          if ($LASTEXITCODE -ne 0) { throw "could not resolve the artifact name" }
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Artifact: $name"
+
+      - name: Build installer
+        run: uv run python scripts/build.py --platform windows --clean
+
+      - name: Verify installer file
+        run: uv run python scripts/build.py --platform windows --verify-only
+
+      - name: Smoke test install, launch and uninstall
+        run: uv run python scripts/smoke_test.py --platform windows
+
+      - name: Upload installer
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkfall-windows-x86_64
+          path: dist/${{ steps.meta.outputs.name }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkfall-windows-build-logs
+          path: |
+            build/logs/*.log
+            build/smoke/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-archive:
+    name: Linux x86_64 archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native build and runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf \
+            libgl1 \
+            libegl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-keysyms1 \
+            libxcb-render-util0 \
+            libxcb-image0 \
+            libxcb-util1 \
+            libdbus-1-3 \
+            libfontconfig1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies (runtime + build group)
+        run: uv sync --locked --group build
+
+      - name: Check build configuration and assets
+        run: uv run pytest tests/test_build_config.py tests/test_build_icons.py tests/test_vazirmatn_font.py tests/test_preview_backgrounds.py -q
+
+      - name: Resolve artifact name
+        id: meta
+        shell: bash
+        run: |
+          name=$(uv run python -c "from scripts.build_config import project_version, linux_archive_name; print(linux_archive_name(project_version()))")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Artifact: $name"
+
+      - name: Build archive
+        run: uv run python scripts/build.py --platform linux --clean
+
+      - name: Verify archive contents and permissions
+        run: uv run python scripts/build.py --platform linux --verify-only
+
+      - name: Smoke test extract and launch
+        run: uv run python scripts/smoke_test.py --platform linux
+
+      - name: Upload archive
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkfall-linux-x86_64
+          path: dist/${{ steps.meta.outputs.name }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkfall-linux-build-logs
+          path: |
+            build/logs/*.log
+            build/smoke/*.json
+          if-no-files-found: ignore
+          retention-days: 14
