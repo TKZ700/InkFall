@@ -38,6 +38,10 @@ First preview build of Inkfall as a packaged desktop application.
 - Added `.github/workflows/build.yml` with native Windows and Linux jobs,
   manual dispatch with artifact upload, pull-request builds, and
   least-privilege permissions.
+- Extended `.github/workflows/build.yml` so pushing a version tag
+  (`v<version>` matching `pyproject.toml`) publishes a GitHub Release with
+  both artifacts after both native builds succeed; the release-readiness
+  checklist lives in `RELEASING.md`.
 - Set the project version to `0.1.0`.
 
 ### Application features present in this preview

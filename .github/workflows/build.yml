@@ -1,20 +1,29 @@
 name: Build preview artifacts
 
-# Builds the two Inkfall 0.1.0 preview artifacts on native runners:
+# Builds the two Inkfall preview artifacts on native runners:
 #   * Windows x64 NSIS setup installer
 #   * Linux x86_64 standalone .tar.gz
 #
 # Manual runs upload both files as workflow artifacts (not a GitHub
 # Release). Pull requests and branch pushes build and smoke-test only.
+#
+# Pushing a version tag (v<version>, e.g. v0.1.0) additionally publishes
+# a GitHub Release with both artifacts after BOTH builds succeed. A tag
+# push publishes binaries publicly: clear the release-readiness gate in
+# RELEASING.md first — the open obligations in THIRD_PARTY_NOTICES.md
+# must not be mistaken for completed work.
 
 on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
+    tags:
+      - 'v*'
 
-# Least privilege: the workflow reads the repository and uploads
-# ephemeral artifacts. It never writes contents, packages or releases.
+# Least privilege: the workflow-level token is read-only and only uploads
+# ephemeral artifacts. The sole exception is the tag-triggered
+# publish-release job below, which scopes its own write permission.
 permissions:
   contents: read
 
@@ -44,6 +53,13 @@ jobs:
       - name: Install locked dependencies (runtime + build group)
         run: uv sync --locked --group build
 
+      # Fail a mismatched tag before the 90-minute build instead of after it.
+      - name: Verify release tag matches the project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          uv run python -c "import os; from scripts.build_config import validate_release_tag; validate_release_tag(os.environ['GITHUB_REF_NAME'])"
+
       - name: Check build configuration and assets
         run: uv run pytest tests/test_build_config.py tests/test_build_icons.py tests/test_vazirmatn_font.py tests/test_preview_backgrounds.py -q
 
@@ -66,7 +82,7 @@ jobs:
         run: uv run python scripts/smoke_test.py --platform windows
 
       - name: Upload installer
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: inkfall-windows-x86_64
@@ -120,6 +136,13 @@ jobs:
       - name: Install locked dependencies (runtime + build group)
         run: uv sync --locked --group build
 
+      # Fail a mismatched tag before the 90-minute build instead of after it.
+      - name: Verify release tag matches the project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          uv run python -c "import os; from scripts.build_config import validate_release_tag; validate_release_tag(os.environ['GITHUB_REF_NAME'])"
+
       - name: Check build configuration and assets
         run: uv run pytest tests/test_build_config.py tests/test_build_icons.py tests/test_vazirmatn_font.py tests/test_preview_backgrounds.py -q
 
@@ -141,7 +164,7 @@ jobs:
         run: uv run python scripts/smoke_test.py --platform linux
 
       - name: Upload archive
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: inkfall-linux-x86_64
@@ -159,3 +182,121 @@ jobs:
             build/smoke/*.json
           if-no-files-found: ignore
           retention-days: 14
+
+  # Publishes the release. Runs only for a pushed version tag, and only
+  # after BOTH native builds (and their smoke tests) succeeded: a failed
+  # or skipped build job skips this job, so nothing is published. This is
+  # the workflow's only job with write permission.
+  publish-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-24.04
+    needs: [windows-installer, linux-archive]
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
+    permissions:
+      # Scoped override of the workflow-level contents: read. Creating the
+      # release and uploading its assets is the only write this does.
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify the tag matches the project version and resolve asset names
+        id: meta
+        run: |
+          set -euo pipefail
+          # build_config is stdlib-only, so no Python setup step is needed.
+          # validate_release_tag raises unless the tag encodes exactly the
+          # pyproject.toml version, so a release can never be published
+          # under a version it was not built from.
+          python3 - <<'PY' | tee -a "$GITHUB_OUTPUT"
+          import os
+
+          from scripts.build_config import (
+              linux_archive_name,
+              validate_release_tag,
+              windows_installer_name,
+          )
+
+          version = validate_release_tag(os.environ["GITHUB_REF_NAME"])
+          print(f"version={version}")
+          print(f"windows_asset={windows_installer_name(version)}")
+          print(f"linux_asset={linux_archive_name(version)}")
+          PY
+
+      - name: Confirm the tag exists on the remote
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --tags origin "refs/tags/${GITHUB_REF_NAME}" >/dev/null
+          echo "tag ${GITHUB_REF_NAME} exists on origin"
+
+      - name: Download the built Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: inkfall-windows-x86_64
+          path: dist
+
+      - name: Download the built Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: inkfall-linux-x86_64
+          path: dist
+
+      - name: Verify both release assets are present and non-empty
+        env:
+          WINDOWS_ASSET: ${{ steps.meta.outputs.windows_asset }}
+          LINUX_ASSET: ${{ steps.meta.outputs.linux_asset }}
+        run: |
+          set -euo pipefail
+          for asset in "$WINDOWS_ASSET" "$LINUX_ASSET"; do
+            if [ ! -s "dist/$asset" ]; then
+              echo "::error::release asset missing or empty: dist/$asset"
+              exit 1
+            fi
+            printf 'verified dist/%s (%s bytes)\n' "$asset" "$(wc -c < "dist/$asset")"
+          done
+          actual="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          expected="$(printf '%s\n%s\n' "$LINUX_ASSET" "$WINDOWS_ASSET" | LC_ALL=C sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::dist/ must contain exactly the two expected release assets"
+            echo "expected:"; printf '%s\n' "$expected"
+            echo "actual:"; printf '%s\n' "$actual"
+            exit 1
+          fi
+
+      - name: Refuse to touch an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::a GitHub release for ${GITHUB_REF_NAME} already exists."
+            echo "This workflow never deletes or overwrites a release or its assets."
+            echo "For the deliberate manual recovery steps see 'Recovery' in RELEASING.md."
+            exit 1
+          fi
+
+      - name: Create the release and upload both assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WINDOWS_ASSET: ${{ steps.meta.outputs.windows_asset }}
+          LINUX_ASSET: ${{ steps.meta.outputs.linux_asset }}
+        run: |
+          set -euo pipefail
+          # --verify-tag aborts unless the tag already exists: this job
+          # never creates a tag (least of all from the default branch).
+          # --prerelease: the project is an early preview (see README.md);
+          # remove this flag when a stable version ships.
+          # --generate-notes: GitHub's generated release notes ("Full
+          # Changelog"); refine them on the release page afterwards if
+          # wanted — they are never invented by this workflow.
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --title "InkFall $GITHUB_REF_NAME" \
+            --generate-notes \
+            "dist/$WINDOWS_ASSET" \
+            "dist/$LINUX_ASSET"
+          echo "published release assets:"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'

@@ -27,6 +27,7 @@ from scripts.build_config import (
     project_version,
     required_bundle_entries,
     standalone_binary_name,
+    validate_release_tag,
     windows_installer_name,
 )
 
@@ -323,3 +324,53 @@ def test_main_routes_self_test() -> None:
     sys.platform != "win32", reason="host-specific default behaviour")
 def test_host_platform_is_detected() -> None:
     assert build_config.host_platform() == "windows"
+
+
+def test_release_tag_accepts_the_tagged_project_version() -> None:
+    version = project_version()
+    assert validate_release_tag(f"v{version}") == version
+
+
+def test_release_tag_mismatch_is_rejected() -> None:
+    """A tag encoding a different version must never publish."""
+    with pytest.raises(BuildError) as excinfo:
+        validate_release_tag("v9.9.9")
+    message = str(excinfo.value)
+    assert "does not match" in message
+    assert project_version() in message
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "0.1.0",  # exact version but missing the v prefix
+        "release-0.1.0",  # wrong prefix
+        "V0.1.0",  # tags are case-sensitive; only lowercase v is a tag
+        "v",  # prefix with an empty version body
+        "",  # not a tag at all
+    ],
+)
+def test_malformed_release_tags_are_rejected(tag: str) -> None:
+    with pytest.raises(BuildError):
+        validate_release_tag(tag)
+
+
+def test_release_workflow_guards_are_in_place() -> None:
+    """Textual scope guard over .github/workflows/build.yml.
+
+    The release job must depend on both native builds, run only for a
+    version tag, verify the tag exists, and be the only job granted write
+    access; both platform artifacts must upload on tag runs so the release
+    job can download them. Reformatting build.yml means updating this test
+    deliberately, the same way the other scope guards do.
+    """
+    text = (SOURCE_ROOT / ".github" / "workflows" / "build.yml").read_text(
+        encoding="utf-8")
+    assert "    tags:\n      - 'v*'" in text
+    assert "needs: [windows-installer, linux-archive]" in text
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in text
+    assert "--verify-tag" in text
+    assert text.count("contents: write") == 1
+    assert text.count(
+        "if: github.event_name == 'workflow_dispatch'"
+        " || startsWith(github.ref, 'refs/tags/v')") == 2

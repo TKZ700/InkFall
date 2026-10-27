@@ -278,12 +278,15 @@ Workflow: `.github/workflows/build.yml` (**Build preview artifacts**).
 |---|---|---|
 | `windows-installer` | `windows-2022` | `Inkfall-0.1.0-windows-x86_64-setup.exe` |
 | `linux-archive` | `ubuntu-24.04` | `inkfall-0.1.0-linux-x86_64.tar.gz` |
+| `publish-release` | `ubuntu-24.04` | GitHub Release with both files (version tags only) |
 
 Triggers:
 
 - `workflow_dispatch` — manual run; uploads both artifacts.
 - `pull_request` — builds and smoke-tests, uploads nothing.
-- `push` to `master` — builds and smoke-tests, uploads nothing.
+- `push` to `main` — builds and smoke-tests, uploads nothing.
+- `push` of a version tag `v<version>` (e.g. `v0.1.0`) — the same two
+  builds, plus the `publish-release` job described below.
 
 Each job uses `uv sync --locked --group build`, i.e. the same lockfile and
 the same `scripts/build.py` as local builds. `--locked` makes the job fail
@@ -296,9 +299,21 @@ Nuitka starts, so a stale ICO, a missing font/licence, a preview-background
 regression, a missing `--windows-icon-from-ico`, or a dropped
 `--include-qt-plugins=qml` fails the run before the long compile.
 
-Permissions are `contents: read`. The workflow never creates a tag, release
-or public asset. On failure it uploads the Nuitka log and the self-test JSON
-so the two jobs stay independently diagnosable.
+Permissions are `contents: read` at the workflow level. Ordinary runs
+(manual dispatch, pull requests, branch pushes) never create a tag, release
+or public asset. The only exception is a pushed version tag `v<version>`
+that matches the project version: after both builds and smoke tests
+succeed, the `publish-release` job — the only job granted `contents: write`
+— creates a GitHub Release for that existing tag, uploads the two
+distribution files as release assets and attaches GitHub-generated release
+notes. The release is marked as a prerelease while the project is an early
+preview. The workflow never deletes or overwrites an existing release or
+asset, and never creates a git tag. See [RELEASING.md](RELEASING.md) for
+the release-readiness gate (the open obligations in
+`THIRD_PARTY_NOTICES.md` must be complete first) and the recovery
+procedure for a partial release. On failure the workflow uploads the
+Nuitka log and the self-test JSON so the two jobs stay independently
+diagnosable.
 
 The Linux job installs the Qt runtime libraries listed above before the
 smoke test; the Linux build baseline is therefore **Ubuntu 24.04 (glibc
@@ -312,7 +327,9 @@ smoke test; the Linux build baseline is therefore **Ubuntu 24.04 (glibc
    - `inkfall-windows-x86_64`
    - `inkfall-linux-x86_64`
 
-Artifacts are retained for 14 days and are not public releases.
+Artifacts are retained for 14 days and are not public releases. Permanent,
+public downloads come from GitHub Releases created by the
+`publish-release` job on a version-tag push (see [RELEASING.md](RELEASING.md)).
 
 ## Troubleshooting
 
@@ -338,6 +355,7 @@ artifacts must be treated as **unverified**.
 ## Licensing
 
 Building these artifacts privately does **not** resolve distribution
-licensing. PyMuPDF is AGPL-3.0 or commercial, and the project has no
-`LICENSE` file or third-party notice file yet. Do not publish the artifacts
-publicly until that is resolved.
+licensing. Inkfall is `AGPL-3.0-only` (see `LICENSE`), PyMuPDF is AGPL-3.0
+or commercial, and Qt is LGPL-3.0; the outstanding distribution
+obligations are tracked in `THIRD_PARTY_NOTICES.md` and are not yet
+complete. Do not publish the artifacts publicly until they are resolved.

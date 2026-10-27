@@ -34,6 +34,7 @@ __all__ = [
     "project_version",
     "required_bundle_entries",
     "standalone_binary_name",
+    "validate_release_tag",
     "windows_installer_name",
 ]
 
@@ -172,6 +173,29 @@ def project_version(source_root: Path = SOURCE_ROOT) -> str:
     if not version:
         raise BuildError(f"{pyproject} declares no [project] version")
     return version
+
+
+def validate_release_tag(tag: str, *, source_root: Path = SOURCE_ROOT) -> str:
+    """Check that a ``v<version>`` release tag encodes the project version.
+
+    Release automation may only publish binaries under a tag whose version
+    matches ``pyproject.toml`` exactly (tag ``v0.1.0`` for version
+    ``0.1.0``). Anything else fails loudly instead of publishing a pairing
+    of one version's tag with another version's artifacts. Returns the
+    validated version string.
+
+    Raises:
+        BuildError: if ``tag`` is not ``v`` followed by the project version.
+    """
+    version = tag[1:] if tag.startswith("v") else ""
+    project = project_version(source_root)
+    if not version or version != project:
+        raise BuildError(
+            f"release tag {tag!r} does not match the project version "
+            f"{project!r} declared in pyproject.toml; the release workflow "
+            f"requires the tag 'v{project}'"
+        )
+    return project
 
 
 def windows_installer_name(version: str) -> str:
