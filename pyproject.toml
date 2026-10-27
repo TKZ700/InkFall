@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "Inkfall - a PDF reader and ink annotation notebook"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+# PEP 639 SPDX expression. Requires hatchling >= 1.27.0 (declared below),
+# the minimum the Python Packaging User Guide lists for PEP 639 support.
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+]
 dependencies = [
   "PyMuPDF",
   "PySide6",
@@ -25,7 +31,7 @@ build = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

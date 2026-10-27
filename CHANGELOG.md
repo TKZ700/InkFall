@@ -60,5 +60,9 @@ First preview build of Inkfall as a packaged desktop application.
   self-test only.
 - Packaging output is limited to the two artifacts above; wheels from
   `uv build` are not a supported distribution format.
-- Distribution licensing (notably PyMuPDF's AGPL-3.0/commercial terms) is
-  unresolved. Do not publish binaries publicly yet.
+- Project licensing decided: `AGPL-3.0-only`, with a root `LICENSE`
+  (GNU AGPL-3.0 text), `CONTRIBUTING.md` and `THIRD_PARTY_NOTICES.md`.
+- Third-party distribution obligations (notably PyMuPDF's AGPL-3.0
+  notice/source terms and Qt's LGPL-3.0 notice obligations) are tracked
+  in `THIRD_PARTY_NOTICES.md` and not yet complete. Do not publish
+  binaries publicly yet.

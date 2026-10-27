@@ -7,9 +7,11 @@ around organizing the documents you actually study.
 
 > **Status: `0.1.0` early public preview.**
 > The feature scope for this preview is implemented in source, but the
-> project is not release-ready: no binary has been published, PyMuPDF
-> distribution licensing is unresolved, and manual QA on real hardware is
-> still required. See [Known limitations](#known-limitations).
+> project is not release-ready: no binary has been published, the
+> third-party notice and redistribution obligations tracked in
+> [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) are not yet complete,
+> and manual QA on real hardware is still required. See
+> [Known limitations](#known-limitations).
 
 ## Overview
 
@@ -237,22 +239,33 @@ separately.
 - **Packaging.** Wheels produced by `uv build` are not a supported
   distribution format; the standalone installers and archive are.
 
-## Licensing — unresolved before public distribution
+## License
 
-The project's `pyproject.toml` declares MIT, but there is no `LICENSE` file
-and no distribution decision has been made. This must be resolved before
-binaries are published publicly:
+Inkfall is free software released under the **GNU Affero General Public
+License v3.0 only** (SPDX identifier: `AGPL-3.0-only`). The complete
+license text is in [LICENSE](LICENSE), and the GNU Project publishes the
+official copy at <https://www.gnu.org/licenses/agpl-3.0.txt> (see
+<https://www.gnu.org/licenses/#AGPL> for background on the license).
 
-- **PyMuPDF** (PDF backend) is offered under **AGPL-3.0 or a commercial
-  licence**. Shipping Inkfall binaries without an AGPL-compatible release or
-  a commercial PyMuPDF licence is a blocker.
-- **PySide6 / Qt** is offered under LGPL-3.0/GPL-3.0/commercial terms;
-  LGPL redistribution has relinking and notice obligations.
-- **NumPy** (BSD-3-Clause) and the bundled **Inter** and **Vazirmatn**
-  fonts (both SIL OFL-1.1) also require notices.
+- Inkfall is available free of charge, subject to the license's terms.
+- You may inspect, modify and redistribute Inkfall's covered source
+  according to the AGPL.
+- **Commercial use is permitted.** The AGPL does not prohibit commercial
+  use; it requires that its distribution conditions are met.
+- If you distribute modified versions, they must comply with the AGPL's
+  requirements, including keeping the license and copyright intact and
+  making corresponding source available (section 13 extends source
+  obligations to users interacting with a modified version over a
+  network).
 
-No third-party notice file exists yet. Private CI builds do not make public
-distribution legally cleared.
+Inkfall also bundles third-party components — PyMuPDF, PySide6/Qt, NumPy,
+the Python runtime and the Inter and Vazirmatn fonts — whose licenses
+impose their own notice, source and redistribution obligations. That
+audit, including which obligations are verified and which remain open, is
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Completing it is a
+prerequisite for a public binary release.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Development
 
