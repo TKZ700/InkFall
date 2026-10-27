@@ -851,6 +851,11 @@ class PdfViewer(QWidget):
         self._hscrollbar = QScrollBar(Qt.Orientation.Horizontal, self)
         self._hscrollbar.setCursor(Qt.CursorShape.ArrowCursor)  # as above
         self._hscrollbar.valueChanged.connect(self._on_scroll)
+        # Width-gated visibility: hidden entirely until horizontal
+        # overflow exists (see _set_hscrollbar_visible); _sync_scrollbar
+        # owns the state, the fade chrome only animates what is shown.
+        self._hscrollbar_shown = False
+        self._hscrollbar.setVisible(False)
         # Presentation-only fade chrome: visible on hover/scroll, idle
         # fades out. Scroll mechanics (_on_scroll, ranges, glide) and
         # the resize veto are untouched — opacity never gates input.
@@ -3395,6 +3400,7 @@ class PdfViewer(QWidget):
             self._scrollbar.setValue(0)
             self._hscrollbar.setRange(0, 0)
             self._hscrollbar.setValue(0)
+            self._set_hscrollbar_visible(False)
             return
         total_logical = self._pipeline.layout.total_height_px * self._display_scale()
         maximum = max(0, int(total_logical - float(self.height())))
@@ -3404,6 +3410,11 @@ class PdfViewer(QWidget):
         total_w_logical = self._pipeline.layout.total_width_px * scale
         hmaximum = max(0, int(total_w_logical - float(self.width())))
         self._hscrollbar.setRange(0, hmaximum)
+        # Width-based visibility: the bar exists only when the content is
+        # genuinely wider than the viewport. Recomputed on every range
+        # sync (resize, zoom, rotation, page ops, document switch), so
+        # the state can never go stale.
+        self._set_hscrollbar_visible(hmaximum > 0)
         if not hmaximum:
             self._hscrollbar.setValue(0)
         elif h_anchor is not None and scale > 0:
@@ -3460,6 +3471,40 @@ class PdfViewer(QWidget):
         except Exception:
             pass
         return False
+
+    def _set_hscrollbar_visible(self, visible: bool) -> None:
+        """Show the horizontal bar only while horizontal overflow exists.
+
+        M5-B.1.2 revealed both bars as one fade unit, so the horizontal
+        bar flashed on every vertical scroll even when the document fit
+        (its QSS groove + min-width handle still painted at full width).
+        The bar is now hidden entirely — not faded, disabled, or left
+        with a zero-length thumb — until its range is non-zero. State is
+        tracked explicitly (``isVisible`` also reads False while the
+        viewer itself is offscreen, which would skip real transitions).
+        Fit math keeps reserving the strip unconditionally, so appearing
+        overflow never toggles fit zoom (no oscillation); the docked
+        geometry is likewise untouched, preserving the vertical bar's
+        layout.
+        """
+        desired = bool(visible)
+        if getattr(self, "_hscrollbar_shown", None) is desired:
+            return
+        self._hscrollbar_shown = desired
+        try:
+            self._hscrollbar.setVisible(desired)
+        except Exception:
+            pass
+        if desired:
+            # Overflow just appeared (zoom, wide page, narrower window):
+            # reveal through the normal fade so the user sees it.
+            self._poke_scrollbar()
+        else:
+            try:
+                if self._hscrollbar_fx is not None:
+                    self._hscrollbar_fx.setOpacity(0.0)
+            except Exception:
+                pass
 
     def _fade_scrollbar(self, to_opacity: float) -> None:
         """Animate scrollbar chrome opacity (presentation only).

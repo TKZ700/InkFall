@@ -1,8 +1,9 @@
 # Inkfall
 
-Inkfall is a desktop PDF reader and ink annotation notebook. It combines a
-PDF page renderer with a pressure-aware pen/highlighter canvas, shape
-recognition with live adjustment, and a document library with folders.
+Inkfall is a stylus-first PDF annotation and study application for
+Windows and Linux. It pairs a continuous PDF reader with a responsive
+handwriting canvas, hold-to-recognize smart shapes, and a Library built
+around organizing the documents you actually study.
 
 > **Status: `0.1.0` early public preview.**
 > The feature scope for this preview is implemented in source, but the
@@ -10,24 +11,102 @@ recognition with live adjustment, and a document library with folders.
 > distribution licensing is unresolved, and manual QA on real hardware is
 > still required. See [Known limitations](#known-limitations).
 
-## What Inkfall does
+## Overview
 
-- **PDF reading** — open documents in tabs, page navigation, continuous and
-  paged layouts, zoom, rotation, and a read-only session mode.
-- **Ink** — pen and highlighter strokes with pressure-sensitive width,
-  eraser, selection, move/copy/paste, and undo/redo.
-- **Shapes** — freehand recognition of lines, arrows, rectangles, circles,
-  triangles and polygons; recognised lines and closed shapes can be
-  adjusted by dragging handles, with endpoint snapping to nearby geometry.
-- **Library** — import PDFs, create folders, List and Grid views, search,
-  sorting, thumbnails, and drag-and-drop of books between folders.
-- **Persistence** — annotations are saved into the PDF as an embedded
-  Inkfall manifest (`inkfall.annotations.v1.json`), so a saved document
-  carries its Inkfall annotations with it.
+Inkfall is designed for sustained reading and annotation: a focused
+workspace built around the document, a configurable tool shelf instead of
+a crowded fixed toolbar, and reading modes that keep long sessions
+comfortable. Everything you write is stored inside the PDF itself, so an
+annotated document carries its Inkfall notes with it.
 
-This list describes what the source implements. It is not a performance or
-stability guarantee, and much of it has only been exercised by automated
-tests, not by a broad manual test pass.
+The ink engine is built for natural handwriting: strokes are rendered
+from real input samples with smoothing and per-event incremental
+updates, and stylus pressure can modulate stroke width where the device
+provides it. There are no published latency or frame-rate figures — the
+goal is simply an inking experience that keeps up with the pen.
+
+## Key features
+
+### Inking
+
+- **Pen and highlighter** with smooth, pressure-aware stroke rendering
+  (per-tool pressure toggle, with a selectable pressure profile in
+  settings; devices without pressure fall back to a constant width).
+- **Eraser** with whole-stroke and partial-erase modes.
+- **Selection, move, copy and paste** for ink, with full undo/redo.
+- Strokes are stored as vector ink with their input history, not
+  flattened bitmaps.
+
+### Hold-to-recognize smart shapes
+
+Draw a rough shape and **hold the stylus down briefly** (about a third
+of a second, no need to be perfectly still). Inkfall replaces the rough
+stroke with a clean recognized shape:
+
+- **Recognized kinds:** lines, rectangles, circles, triangles, and
+  polygons (polygons may be drawn as several connected strokes and are
+  merged into one shape).
+- **Live adjustment:** with the stylus still down after recognition,
+  keep moving to adjust the recognized geometry before releasing —
+  recognized lines and closed shapes (rectangle, circle, triangle,
+  polygon) support this; line endpoints can snap to nearby geometry.
+- Highlighter conversions are not adjustable: moving the pen after a
+  highlighter hold cancels the conversion instead.
+
+### A toolbar you configure
+
+Inkfall's tool shelf holds your tools as configurable instances rather
+than a fixed set:
+
+- Add, duplicate, remove and drag-reorder tool slots; keep a wide red
+  pen, a thin blue pen, and a soft highlighter side by side.
+- Per-tool properties: color, width, opacity, fill (color, opacity,
+  on/off for closed shapes), line style, endings, angle snapping and
+  more, depending on the tool.
+- Reusable color, size and opacity presets, including a permanent
+  **No Fill** slot on fill strips.
+- Dock the shelf on the left, right, top or bottom edge; Pan and
+  Selection are always present as built-ins.
+
+### Reading modes for every environment
+
+Three distinct PDF appearance modes — **Light** (original colors),
+**Dark** (night reading: lightness inverted while hue and saturation are
+preserved), and **Inverted** (full-color inversion) — so on-screen
+reading and studying stay comfortable in bright rooms and at night.
+Selection happens in the view controls panel and applies to the rendered
+pages, not just the UI chrome.
+
+### A study-focused workspace
+
+- A clean reading surface: the document fills the workspace, and
+  scrollbars, HUD and shelf fade away when idle.
+- **Library** home for your study materials: import PDFs, organize them
+  in folders (with drag-and-drop), recent/favorites/recency views, List
+  and Grid layouts, global search, and lazy thumbnails.
+- Reading position is remembered per document and restored on reopen.
+- Page navigator with thumbnails, continuous and paged layouts, zoom
+  and rotation, fit-width/fit-page modes, and a fullscreen reading mode.
+- Read-only sessions: opening a document that is already open offers a
+  non-persisting read-only copy instead of a second editor.
+
+### Annotations that travel with the PDF
+
+Saving embeds an Inkfall annotation manifest inside the PDF
+(`inkfall.annotations.v1.json`) alongside native PDF annotations, so a
+saved document carries its Inkfall ink with it; the original file is
+never moved or modified while you work.
+
+### Language and typography
+
+The UI ships with the **Inter** typeface, and **Vazirmatn** is bundled
+so Persian/Arabic text renders correctly even where neither font is
+installed; Arabic-script runs inside mixed strings fall back to
+Vazirmatn per character.
+
+This list describes what the source implements. It is not a performance
+or stability guarantee, and much of it has only been exercised by
+automated tests, not by a broad manual test pass.
 
 ## Install the Windows preview build
 
@@ -149,7 +228,12 @@ separately.
 - **Linux compatibility is bounded** by the glibc of the build distribution
   (see above).
 - **Native stylus/pressure input** is exercised by automated tests with
-  synthetic events, not by a hardware test matrix.
+  synthetic events, not by a hardware test matrix. Pressure behaviour
+  therefore varies by device and driver; Inkfall does not guarantee
+  uniform behaviour across every stylus or tablet.
+- **Shape recognition** covers lines, rectangles, circles, triangles and
+  polygons; it does not recognize arrows or ovals (an ellipse drawn with
+  the shape tool is a drawn shape, not a hold-to-recognize target).
 - **Packaging.** Wheels produced by `uv build` are not a supported
   distribution format; the standalone installers and archive are.
 
