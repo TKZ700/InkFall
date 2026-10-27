@@ -11,6 +11,7 @@ No rasterization, no text extraction, no pixmaps, no full-page scan.
 
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 
@@ -141,6 +142,9 @@ class PdfBackend:
         self._password = password
         # Tri-state cache for the encrypted-rewrite capability probe.
         self._rewrite_supported: bool | None = None
+        # Snapshot file backing the live handle after a same-path save
+        # (see export_pdf). Deleted when the handle it backs is closed.
+        self._snapshot_pending: str | None = None
         # Snapshot scalar header state at open time so basic accessors do
         # not need to touch pages. len() reads the trailer (O(1)).
         try:
@@ -533,33 +537,49 @@ class PdfBackend:
     def ensure_export_supported(self) -> None:
         """Refuse an encrypted source that cannot keep its protection.
 
-        The probe snapshots the document with ``PDF_ENCRYPT_KEEP`` — the
-        same write used by the export — and therefore fails only when this
-        PyMuPDF build cannot carry the source encryption into the
-        snapshot. Saving is refused explicitly instead of silently
-        producing a differently protected PDF.
+        The probe writes the document to a throwaway file with
+        ``PDF_ENCRYPT_KEEP`` — the same write used by the export — and
+        therefore fails only when this PyMuPDF build cannot carry the
+        source encryption into the snapshot. The probe is disk-backed,
+        never a full in-memory serialization, so probing an encrypted
+        document does not duplicate it in RAM. Saving is refused
+        explicitly instead of silently producing a differently protected
+        PDF.
         """
         self._ensure_open()
         if not self._encrypted_at_open:
             return
         if self._rewrite_supported is None:
+            fd, probe_path = tempfile.mkstemp(
+                prefix="inkfall-probe-", suffix=".pdf")
+            os.close(fd)
             try:
-                self._doc.tobytes(encryption=_PDF_ENCRYPT_KEEP)
+                os.remove(probe_path)
+            except OSError:
+                pass
+            try:
+                self._doc.save(probe_path, encryption=_PDF_ENCRYPT_KEEP)
+                self._rewrite_supported = True
             except Exception:
                 self._rewrite_supported = False
-            else:
-                self._rewrite_supported = True
+            finally:
+                try:
+                    if os.path.isfile(probe_path):
+                        os.remove(probe_path)
+                except Exception:
+                    pass
         if not self._rewrite_supported:
             raise EncryptedRewriteError(_ENCRYPTED_REWRITE_MESSAGE)
 
-    def _open_snapshot(self, snapshot: bytes):
-        """Open an export snapshot; authenticate if it kept its encryption.
+    def _open_snapshot(self, snapshot_path: str):
+        """Open an export snapshot file; authenticate if it kept encryption.
 
-        Returns ``(document, was_encrypted)``. The encryption state is
+        Returns ``(document, was_encrypted)``. The file must outlive the
+        returned handle (PyMuPDF keeps it open). The encryption state is
         sampled before authenticating because PyMuPDF stops reporting it
         once access is granted.
         """
-        doc = pymupdf.open("pdf", snapshot)
+        doc = pymupdf.open(snapshot_path)
         try:
             protected = bool(doc.needs_pass or doc.is_encrypted)
             if doc.needs_pass:
@@ -594,23 +614,28 @@ class PdfBackend:
                    expected_paper_keywords: str | None = None) -> None:
         """Atomically write a verified PDF with native annotations + manifest.
 
-        The export is built from a fresh snapshot. Native annotations are
-        added once to the snapshot with a regenerated appearance stream,
-        the constant manifest attachment is added or updated (never
-        duplicated), and the result is written to a unique temporary file
-        in the target directory. The temporary file is reopened and checked
-        for the expected page count, manifest bytes, retained PaperSpec
-        keyword, and the exact expected native annotations with renderable
-        appearance streams before ``os.replace`` makes it the target.
+        The export is built from a fresh snapshot of the live document,
+        written to a private on-disk temp file so peak memory stays bounded
+        on large PDFs (the snapshot is never held as a bytes object).
+        Native annotations are added once to the snapshot with a
+        regenerated appearance stream, the constant manifest attachment is
+        added or updated (never duplicated), and the result is written to a
+        unique temporary file in the target directory. The temporary file
+        is reopened and checked for the expected page count, manifest
+        bytes, retained PaperSpec keyword, and the exact expected native
+        annotations with renderable appearance streams before
+        ``os.replace`` makes it the target.
 
         Same-path saves release the live PyMuPDF handle before replacement
         (Windows/worker locks), then install a prepared replacement handle
-        built from the same pre-save snapshot so the live session remains
-        usable without reloading the file. Encrypted sources are snapshotted
-        and written with ``PDF_ENCRYPT_KEEP`` so the output keeps the same
-        protection; if that cannot be guaranteed the save is refused. On any
-        failure the original file is untouched and the live handle remains
-        valid.
+        built from the same pre-save snapshot — file-backed like the
+        snapshot itself — so the live session remains usable without
+        reloading the file; the snapshot file is deleted once no handle
+        needs it (at the latest when the backend closes). Encrypted sources
+        are snapshotted and written with ``PDF_ENCRYPT_KEEP`` so the output
+        keeps the same protection; if that cannot be guaranteed the save is
+        refused. On any failure the original file is untouched and the
+        live handle remains valid.
         """
         self._ensure_open()
         if not target_path or not isinstance(target_path, str):
@@ -626,9 +651,29 @@ class PdfBackend:
 
         self.ensure_export_supported()
 
+        # Disk-backed snapshot. The previous full in-memory serialization
+        # approach held two to three full document copies in RAM at once
+        # (the snapshot bytes, the in-memory annotation holder, and for
+        # same-path saves the replacement handle), which exhausted memory
+        # on large PDFs. Saving the same serialization to a private temp
+        # file and opening file-backed handles from it keeps peak memory
+        # bounded: PyMuPDF reads objects lazily from disk. Encryption
+        # semantics are identical to the old in-memory bytes snapshot.
+        fd, snapshot_path = tempfile.mkstemp(
+            prefix="inkfall-snapshot-", suffix=".pdf")
+        os.close(fd)
         try:
-            snapshot = bytes(self._doc.tobytes(encryption=_PDF_ENCRYPT_KEEP))
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+        try:
+            self._doc.save(snapshot_path, encryption=_PDF_ENCRYPT_KEEP)
         except Exception as e:
+            try:
+                if os.path.isfile(snapshot_path):
+                    os.remove(snapshot_path)
+            except Exception:
+                pass
             if self._encrypted_at_open:
                 raise EncryptedRewriteError(
                     _ENCRYPTED_REWRITE_MESSAGE) from e
@@ -639,7 +684,7 @@ class PdfBackend:
         replacement = None
         temp_path = None
         try:
-            holder, holder_protected = self._open_snapshot(snapshot)
+            holder, holder_protected = self._open_snapshot(snapshot_path)
             if self._encrypted_at_open and not holder_protected:
                 raise EncryptedRewriteError(
                     "The exported copy of this encrypted PDF would lose its "
@@ -652,6 +697,9 @@ class PdfBackend:
             try:
                 os.makedirs(target_dir, exist_ok=True)
             except Exception as e:
+                if _is_destination_lock_error(e):
+                    raise SaveLockedError(
+                        _unwritable_message(target_abs, e)) from e
                 raise InvalidPdfError(
                     f"Cannot prepare save directory: {e}") from e
 
@@ -677,8 +725,14 @@ class PdfBackend:
 
             _write_manifest_attachment(holder, manifest_bytes)
 
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".inkfall-save-", suffix=".pdf", dir=target_dir)
+            try:
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".inkfall-save-", suffix=".pdf", dir=target_dir)
+            except Exception as e:
+                if _is_destination_lock_error(e):
+                    raise SaveLockedError(
+                        _unwritable_message(target_abs, e)) from e
+                raise
             os.close(fd)
             try:
                 os.remove(temp_path)
@@ -713,7 +767,7 @@ class PdfBackend:
             same_target = _same_path(target_abs, self._path)
             if same_target:
                 replacement, replacement_protected = self._open_snapshot(
-                    snapshot)
+                    snapshot_path)
                 if protect_output and not replacement_protected:
                     raise EncryptedRewriteError(
                         "The live replacement copy of this encrypted PDF "
@@ -725,14 +779,27 @@ class PdfBackend:
                     old_doc.close()
                 except Exception:
                     pass
+                # The closed handle may have been backed by a previous
+                # save's snapshot file; nothing needs that file any more.
+                retired, self._snapshot_pending = self._snapshot_pending, None
+                if retired is not None:
+                    try:
+                        if os.path.isfile(retired):
+                            os.remove(retired)
+                    except Exception:
+                        pass
                 try:
                     _replace_target(temp_path, target_abs)
                 except Exception:
                     self._doc = replacement
                     replacement = None
+                    self._snapshot_pending = snapshot_path
                     raise
                 self._doc = replacement
                 replacement = None
+                # The live handle now reads lazily from the snapshot file;
+                # it is deleted when the handle it backs closes (close()).
+                self._snapshot_pending = snapshot_path
             else:
                 _replace_target(temp_path, target_abs)
             temp_path = None
@@ -763,9 +830,17 @@ class PdfBackend:
                 # Defensive: a same-path failure before replacement was
                 # installed must leave a usable live handle.
                 try:
-                    self._doc, _protected = self._open_snapshot(snapshot)
+                    self._doc, _protected = self._open_snapshot(snapshot_path)
+                    self._snapshot_pending = snapshot_path
                 except Exception:
                     self._closed = True
+            if self._snapshot_pending != snapshot_path:
+                # No surviving handle reads the snapshot file: it can go.
+                try:
+                    if os.path.isfile(snapshot_path):
+                        os.remove(snapshot_path)
+                except Exception:
+                    pass
 
     def authenticate(self, password: str) -> bool:
         """Authenticate an encrypted document. Raises on failure."""
@@ -791,6 +866,14 @@ class PdfBackend:
                 doc.close()
         except Exception:
             pass
+        # The handle that pinned the pending snapshot file is gone now.
+        snapshot, self._snapshot_pending = self._snapshot_pending, None
+        if snapshot is not None:
+            try:
+                if os.path.isfile(snapshot):
+                    os.remove(snapshot)
+            except Exception:
+                pass
 
     def _ensure_open(self) -> None:
         if self._closed or self._doc is None:
@@ -870,6 +953,37 @@ def _locked_message(target_abs: str, exc: BaseException) -> str:
             f"sync client, antivirus) and try again. ({exc})")
 
 
+def _unwritable_message(target_abs: str, exc: BaseException) -> str:
+    return ("The destination could not be written: "
+            f"{target_abs}. The location may be read-only, full, or "
+            f"protected; save to a different location instead. ({exc})")
+
+
+#: errno values that mean the destination (file or its directory) cannot
+#: be written: access denied, permission problem, read-only filesystem,
+#: or a resource temporarily held by another handle.
+_DESTINATION_LOCK_ERRNO = frozenset(
+    {errno.EACCES, errno.EPERM, errno.EROFS, errno.EBUSY})
+
+
+def _is_destination_lock_error(exc: BaseException) -> bool:
+    """Classify destination-related write failures without message matching.
+
+    Windows sharing violations (WinError 32/33) and access-denied errors
+    (WinError 5), ``PermissionError`` (including POSIX EACCES/EPERM), and
+    read-only/busy filesystem errnos all mean the destination location
+    cannot be written and are recoverable (Save As a copy). Everything
+    else is a genuine export failure.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "winerror", None) in (5, 32, 33):
+            return True
+        return exc.errno in _DESTINATION_LOCK_ERRNO
+    return False
+
+
 def _replace_target(temp_path: str, target_abs: str) -> None:
     """Atomically replace the destination, classifying lock failures.
 
@@ -884,7 +998,7 @@ def _replace_target(temp_path: str, target_abs: str) -> None:
     except PermissionError as exc:
         raise SaveLockedError(_locked_message(target_abs, exc)) from exc
     except OSError as exc:
-        if getattr(exc, "winerror", None) in (5, 32, 33):
+        if _is_destination_lock_error(exc):
             raise SaveLockedError(_locked_message(target_abs, exc)) from exc
         raise InvalidPdfError(
             f"Cannot replace the saved PDF at {target_abs}: {exc}") from exc

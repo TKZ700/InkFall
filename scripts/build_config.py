@@ -298,6 +298,14 @@ def nuitka_arguments(
 
     if platform == "windows":
         args += [
+            # MSVC cl 14.3 runs out of heap in optimization pass 2 on the
+            # giant generated TUs (numpy einsumfunc, pymupdf mupdf) when
+            # Nuitka fans out C compilation across every core. Low-memory
+            # mode selects memory-frugal C options and implies a single
+            # C compiler job (the Nuitka 4.3.1 --jobs default under low
+            # memory is 1), which keeps peak cl.exe heap usage bounded.
+            # Linux GCC is unaffected; do not slow that build down.
+            "--low-memory",
             "--windows-console-mode=disable",
             f"--windows-icon-from-ico={source_root / WINDOWS_ICON}",
             "--windows-create-installer",

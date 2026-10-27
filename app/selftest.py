@@ -233,6 +233,73 @@ def _collect_checks(report: dict) -> None:
             report["errors"].append(f"QML {relative}: {exc}")
     report["checks"]["qml"] = qml_results
 
+    _check_picker_runtime(report)
+
+
+def _check_picker_runtime(report: dict) -> None:
+    """Instantiate the square color picker exactly like the tool shelf.
+
+    Compiling the QML (above) misses packaged-only failures that happen
+    when the picker is actually hosted: the ``QQuickWidget``/engine pair,
+    the Python bridge context properties, and the live scene graph. The
+    color picker is the only UI surface that constructs its own
+    ``QQuickWidget`` lazily inside a QML-initiated slot, so a
+    frozen-build defect surfaces precisely there ("opening the color
+    picker crashes") and nowhere else. This check builds the same card
+    without a window and records the outcome.
+    """
+    result: dict = {"status": None, "errors": []}
+    report["checks"]["picker_runtime"] = result
+    try:
+        from PySide6.QtCore import QCoreApplication, QUrl, Qt
+        from PySide6.QtQuickWidgets import QQuickWidget
+
+        from app.qml_bridge.color_provider import SquarePickerBridge
+        from app.qml_bridge.hosting import qml_url
+        from app.qml_bridge.theme_bridge import ThemeBridge
+        from app.theme.tokens import dark_tokens
+
+        card_view = QQuickWidget()
+        try:
+            card_view.setResizeMode(
+                QQuickWidget.ResizeMode.SizeRootObjectToView)
+            try:
+                card_view.setClearColor(Qt.GlobalColor.transparent)
+            except Exception:
+                pass
+            bridge = SquarePickerBridge(card_view)
+            theme = ThemeBridge(dark_tokens(), card_view)
+            engine = card_view.engine()
+            engine.rootContext().setContextProperty("bridge", bridge)
+            engine.rootContext().setContextProperty("theme", theme)
+            card_view.setSource(qml_url("toolprops/ColorPicker.qml"))
+            deadline = 0
+            while (card_view.status() == QQuickWidget.Status.Loading
+                   and deadline < 40):
+                QCoreApplication.processEvents()
+                deadline += 1
+            result["status"] = str(card_view.status().name)
+            errors = [e.toString() for e in card_view.errors()]
+            result["errors"] = errors
+            if card_view.status() != QQuickWidget.Status.Ready:
+                report["errors"].append(
+                    "color picker QQuickWidget did not reach Ready: "
+                    f"status={result['status']} errors={errors}")
+        finally:
+            try:
+                card_view.setSource(QUrl())
+            except Exception:
+                pass
+            try:
+                card_view.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        result["status"] = f"exception: {type(exc).__name__}"
+        result["errors"] = [str(exc)]
+        report["errors"].append(
+            f"color picker runtime instantiation failed: {exc}")
+
 
 def _safe_print(text: str, stream=None) -> None:
     """Print without failing when a windowed build has no console.

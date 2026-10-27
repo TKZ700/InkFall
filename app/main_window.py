@@ -2728,6 +2728,61 @@ class MainWindow(QMainWindow):
                 return False
             if not target.lower().endswith(".pdf"):
                 target += ".pdf"
+        return self._save_document_to(doc, target, allow_recovery=True)
+
+    def _recovery_save_target(self, doc) -> str:
+        """A non-overwriting Save As suggestion derived from the original.
+
+        ``document.pdf`` becomes ``document-copy.pdf`` in the same
+        location, so the recovery picker never preselects the inaccessible
+        original. Falls back to the plain suggested name for documents
+        without a save target yet.
+        """
+        try:
+            base = doc.save_target
+        except Exception:
+            base = None
+        if not base:
+            base = self._suggested_save_name(doc)
+        normalized_seps = str(base).replace("\\", "/")
+        if "/" in normalized_seps:
+            directory, name = normalized_seps.rsplit("/", 1)
+            directory += "/"
+        else:
+            directory, name = "", normalized_seps
+        if name.lower().endswith(".pdf"):
+            name = name[:-4]
+        name = "".join(
+            ch for ch in name if ch not in '\\/:*?"<>|').strip() or "Untitled"
+        return f"{directory}{name}-copy.pdf"
+
+    def _offer_save_as_recovery(self, doc, exc: Exception) -> bool:
+        """Offer Save As after a classified destination-write failure.
+
+        Reached only for :class:`SaveLockedError` (file lock / unwritable
+        destination) from an ordinary Save: the document, its annotations,
+        and the undo history are all intact. The failure was already
+        reported; the user picks a fresh destination for a copy. Cancelling
+        or a failing copy save keeps the session dirty and never reports
+        success (the copy save itself reports its own failure). A
+        successful copy follows existing Save As semantics: the live
+        session is re-pointed at the new file.
+        """
+        try:
+            if not doc.can_save:
+                return False
+        except Exception:
+            return False
+        target, _selected = QFileDialog.getSaveFileName(
+            self, "Save a copy as", self._recovery_save_target(doc),
+            "PDF files (*.pdf)")
+        if not target:
+            return False
+        if not target.lower().endswith(".pdf"):
+            target += ".pdf"
+        # No allow_recovery: the user explicitly chose a destination, so a
+        # second failure there is reported once without another picker
+        # (and never retries the original inaccessible path).
         return self._save_document_to(doc, target)
 
     def _suggested_save_name(self, doc) -> str:
@@ -2828,8 +2883,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _save_document_to(self, doc, target: str) -> bool:
-        """Export ``doc`` to ``target`` and register the saved file."""
+    def _save_document_to(self, doc, target: str,
+                          allow_recovery: bool = False) -> bool:
+        """Export ``doc`` to ``target`` and register the saved file.
+
+        With ``allow_recovery`` (ordinary Save only), a classified
+        destination-write failure (:class:`SaveLockedError`) additionally
+        offers the Save As copy flow. Serialization and invalid-document
+        failures never trigger recovery.
+        """
         old_key = None
         try:
             old_key = doc.reading_key
@@ -2841,6 +2903,8 @@ class MainWindow(QMainWindow):
             normalized = self._manager.save_document(doc, target)
         except Exception as exc:
             self._report_save_failure(exc)
+            if allow_recovery and isinstance(exc, SaveLockedError):
+                return self._offer_save_as_recovery(doc, exc)
             return False
         # The export succeeded: reset the dirty baseline (undo stack
         # clean index + document flag) before anything reads it.

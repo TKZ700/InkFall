@@ -46,6 +46,16 @@ REQUIRED_SIZES = (16, 32, 48, 64, 128, 256)
 #: orders of magnitude larger.
 MAX_MEAN_DELTA = 1.0
 
+#: Mean per-pixel RGBA delta allowed between a committed ICO frame and the
+#: same frame regenerated on the current platform. Qt's
+#: SmoothTransformation raster rounding differs by ±1 LSB on a small
+#: fraction of pixels across platforms — the Windows-authored 256 px frame
+#: measures 0.00057 against a Linux regeneration — so non-win32 platforms
+#: compare with this narrow tolerance while the authoring platform keeps
+#: exact equality (and byte equality). Real staleness measures orders of
+#: magnitude higher; test_stale_artwork_fails_decisively pins that gap.
+FRAME_MEAN_DELTA_MAX = 0.05
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -205,7 +215,14 @@ def test_obsolete_legacy_png_ladder_is_not_required() -> None:
 
 
 def test_committed_ico_was_produced_by_the_generator() -> None:
-    """Decoded frames must equal a fresh generation from ``new_icon.png``."""
+    """Decoded frames must equal a fresh generation from ``new_icon.png``.
+
+    On win32 (the authoring platform) decoded pixels and bytes must match
+    exactly. Elsewhere Qt's smooth-scale raster rounding legitimately
+    differs by ±1 LSB on a few pixels, so the same comparison carries the
+    measured narrow tolerance in FRAME_MEAN_DELTA_MAX — far below anything
+    stale artwork could produce (see test_stale_artwork_fails_decisively).
+    """
     import sys
 
     from PySide6.QtGui import QImage
@@ -218,18 +235,50 @@ def test_committed_ico_was_produced_by_the_generator() -> None:
     committed = _decode_ico(ICO.read_bytes())
     fresh = _decode_ico(regenerated)
     assert committed.keys() == fresh.keys()
+    exact = sys.platform == "win32"
     for size in committed:
-        assert _mean_delta(committed[size], fresh[size]) == 0.0, (
-            f"{size}px frame is stale; run "
-            "`uv run python scripts/make_icon.py`")
+        delta = _mean_delta(committed[size], fresh[size])
+        if exact:
+            assert delta == 0.0, (
+                f"{size}px frame is stale; run "
+                "`uv run python scripts/make_icon.py`")
+        else:
+            assert delta <= FRAME_MEAN_DELTA_MAX, (
+                f"{size}px frame is stale (mean delta {delta:.5f} exceeds "
+                f"the cross-platform rounding budget {FRAME_MEAN_DELTA_MAX}); "
+                "run `uv run python scripts/make_icon.py`")
 
-    if sys.platform == "win32":
+    if exact:
         # The committed bytes were produced on Windows; zlib output is
         # expected to be identical, but only assert byte equality where
         # that is the supported authoring platform.
         assert regenerated == ICO.read_bytes(), (
             "committed ICO is stale; run "
             "`uv run python scripts/make_icon.py`")
+
+
+def test_stale_artwork_fails_decisively() -> None:
+    """The cross-platform tolerance must not mask stale or wrong artwork.
+
+    A 180°-rotated master is the tamest possible artwork change (identical
+    colour histogram, same alpha margins). Its regenerated frames must
+    exceed FRAME_MEAN_DELTA_MAX by orders of magnitude on every size, so
+    the platform-gated tolerance in test_committed_ico_was_produced_by_the_
+    generator can only ever absorb ±1 LSB scaling rounding.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage
+
+    source = QImage(str(MASTER_PNG))
+    master = source.flipped(Qt.Orientation.Horizontal | Qt.Orientation.Vertical)
+    stale = _decode_ico(make_icon.build_ico_bytes(master))
+    fresh = _decode_ico(make_icon.build_ico_bytes(source))
+    assert stale.keys() == fresh.keys()
+    for size in stale:
+        delta = _mean_delta(stale[size], fresh[size])
+        assert delta > FRAME_MEAN_DELTA_MAX * 100, (
+            f"rotated artwork at {size}px only measured {delta:.2f}; the "
+            "tolerance would mask real staleness")
 
 
 def test_largest_frame_is_png_compressed_for_size() -> None:

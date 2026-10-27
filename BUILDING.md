@@ -321,6 +321,7 @@ Artifacts are retained for 14 days and are not public releases.
 | `Nuitka is not installed` | run `uv sync --group build` |
 | `cannot build the <platform> artifact on host …` | build on that platform (or use CI); cross-compilation is unsupported |
 | `missing native build tools: patchelf` | install `patchelf` (Linux) |
+| `fatal error C1002: compiler is out of heap space in pass 2` (Windows) | MSVC cl.exe exhausted its optimizer heap on a large generated TU (`numpy`/`pymupdf`). The shared build config already passes `--low-memory` on Windows, which implies a single C compiler job in Nuitka 4.3.1; if a hand-written invocation hits this, add `--low-memory` (not `-j`, which alone does not reduce per-process heap use) |
 | NSIS download fails | install NSIS 3.x and point Nuitka at it |
 | `the standalone build is incomplete; missing: …` | a resource or Qt plugin was not bundled; check the Nuitka log in `build/logs/` |
 | self-test fails on QML | Qt Quick Controls modules missing from the bundle; inspect `build/smoke/self-test.json` |

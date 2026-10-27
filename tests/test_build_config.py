@@ -126,6 +126,28 @@ def test_windows_nuitka_arguments(tmp_path: Path) -> None:
     assert args[-1] == str(SOURCE_ROOT / "main.py")
 
 
+def test_windows_low_memory_c_compilation_is_requested(tmp_path: Path) -> None:
+    """MSVC must not fan out C jobs that exhaust cl's pass-2 heap (C1002).
+
+    On windows-2022 the numpy/pymupdf generated TUs exhaust the cl.exe
+    optimizer heap when Nuitka compiles in parallel. ``--low-memory``
+    selects memory-frugal C options and implies a single C compiler job
+    in Nuitka 4.3.1. Linux GCC never hit this, so its arguments must
+    stay unchanged.
+    """
+    version = project_version()
+    windows_args = nuitka_arguments(
+        "windows", version, source_root=SOURCE_ROOT,
+        build_root=tmp_path / "win", dist_dir=tmp_path / "win")
+    linux_args = nuitka_arguments(
+        "linux", version, source_root=SOURCE_ROOT,
+        build_root=tmp_path / "linux", dist_dir=tmp_path / "linux")
+
+    assert "--low-memory" in windows_args
+    assert "--low-memory" not in linux_args
+    assert not [arg for arg in linux_args if arg.startswith("--jobs")]
+
+
 def test_qml_plugin_family_is_requested_explicitly(tmp_path: Path) -> None:
     """QML data files need the qml plugin family declared up front."""
     for platform in ("windows", "linux"):
