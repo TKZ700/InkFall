@@ -63,6 +63,19 @@ def shell(qtbot, monkeypatch, tmp_path):
     window.show()
     qtbot.addWidget(window)
     yield window
+    # Tear down through the REAL application-exit path. The dirty guard is
+    # bypassed (each test already asserted what it needed) because closing
+    # a dirty window normally cancels: an ad-hoc teardown used to skip
+    # ``PdfViewer.shutdown``, leaving the page-navigator's non-daemon
+    # ``multiprocessing`` children alive. Python's interpreter shutdown
+    # then joins them forever — the window stops responding ("Not
+    # Responding") and is killed, which looks like a crash after a test
+    # run that actually passed.
+    try:
+        window._leave_guard_passed = True
+        window.close()
+    except Exception:
+        pass
     # Belt and braces: discard every document before the store closes.
     try:
         window._viewer.close_document()
@@ -74,6 +87,14 @@ def shell(qtbot, monkeypatch, tmp_path):
                 window._manager.close(doc.id)
             except Exception:
                 pass
+    except Exception:
+        pass
+    try:
+        window._switch_pool.waitForDone(10000)
+    except Exception:
+        pass
+    try:
+        window._save_pool.waitForDone(10000)
     except Exception:
         pass
     store.close()
@@ -334,10 +355,12 @@ def test_serialization_failure_does_not_offer_recovery(
     doc = shell._viewer.current_document
     doc.mark_changed()
 
-    def _boom(_self, _target):
+    def _boom(_self, *_args, **_kwargs):
         raise InvalidPdfError("simulated serialization failure")
 
-    monkeypatch.setattr(PdfBackend, "export_pdf", _boom)
+    # The UI save path exports through the child-process entry point; the
+    # synchronous export_pdf is only used by non-UI callers.
+    monkeypatch.setattr(PdfBackend, "export_pdf_in_process", _boom)
     picker_calls = []
     monkeypatch.setattr(
         "PySide6.QtWidgets.QFileDialog.getSaveFileName",
@@ -368,3 +391,136 @@ def test_readonly_session_never_reaches_recovery(
         ro.write_export(str(tmp_path / "elsewhere.pdf"))
     assert not picker_calls
     shell._manager.close(ro.id)
+
+
+# ---------------------------------------------------------------------------
+# background save (large-PDF freeze)
+# ---------------------------------------------------------------------------
+
+
+def test_save_exports_in_a_child_process_and_keeps_the_loop_alive(
+        shell, tmp_path: Path) -> None:
+    """The export must not run on the GUI thread.
+
+    PyMuPDF holds the GIL for the whole ``Document.save`` call, so even a
+    worker thread freezes Qt (measured: one event-loop iteration in
+    0.97 s). The export therefore runs in a spawned child process while
+    the GUI thread pumps events. A 10 ms heartbeat proves the loop stays
+    alive and ``multiprocessing.active_children`` proves that the export
+    really ran in a separate process.
+    """
+    import multiprocessing
+    import os
+    import threading
+
+    from PySide6.QtCore import QTimer
+
+    pdf = _open_document(shell, tmp_path)
+    doc = shell._viewer.current_document
+    _commit_stroke(doc)
+
+    main_thread = threading.get_ident()
+    gui_threads = []
+    child_pids = []
+    ticks = []
+
+    def _sample():
+        ticks.append(1)
+        gui_threads.append(threading.get_ident())
+        for child in multiprocessing.active_children():
+            if child.name == "inkfall-save" and child.pid not in child_pids:
+                child_pids.append(child.pid)
+
+    timer = QTimer(shell)
+    timer.setInterval(10)
+    timer.timeout.connect(_sample)
+    timer.start()
+    try:
+        assert shell._save_current() is True
+    finally:
+        timer.stop()
+
+    assert ticks, "the GUI event loop never ran during the save"
+    assert set(gui_threads) == {main_thread}, (
+        "save work ran outside the GUI thread unexpectedly")
+    assert child_pids, "the export did not run in a child process"
+    assert os.getpid() not in child_pids
+    assert len(child_pids) == 1
+    assert len(ticks) >= 10, (
+        f"the GUI event loop stalled during the save ({len(ticks)} ticks)")
+    assert not doc.is_dirty
+    assert not shell._viewer.is_loading()
+    assert shell._viewer.isEnabled()
+
+    check = pymupdf.open(pdf)
+    try:
+        assert check[0].first_annot is not None
+    finally:
+        check.close()
+
+
+def test_reentrant_save_during_an_active_save_is_refused(
+        shell, tmp_path: Path, monkeypatch) -> None:
+    """A second Save while one is in flight must not touch the document.
+
+    The nested progress loop still delivers queued slots (e.g. a shortcut
+    or automation timer). Those must be refused, never start a concurrent
+    export over the same live MuPDF handle.
+    """
+    import time
+
+    from PySide6.QtCore import QTimer
+
+    from document.backend import PdfBackend
+
+    _open_document(shell, tmp_path)
+    doc = shell._viewer.current_document
+    doc.mark_changed()
+
+    exports = []
+    real_export = PdfBackend.export_pdf_in_process
+
+    def _slow_export(self, *args, **kwargs):
+        exports.append(1)
+        time.sleep(0.4)
+        return real_export(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PdfBackend, "export_pdf_in_process", _slow_export)
+
+    reentrant = []
+    QTimer.singleShot(80, lambda: reentrant.append(shell._save_current()))
+
+    assert shell._save_current() is True
+    assert reentrant == [False], (
+        "a save re-entered from the nested loop was not refused")
+    assert len(exports) == 1
+    assert not doc.is_dirty
+
+
+def test_failed_save_restores_busy_state_and_keeps_edits(
+        shell, tmp_path: Path, monkeypatch) -> None:
+    """A save failure re-raises on the GUI thread and restores the UI."""
+    from PySide6.QtWidgets import QApplication
+
+    from document.backend import PdfBackend
+    from document.errors import InvalidPdfError
+
+    pdf = _open_document(shell, tmp_path)
+    original_bytes = Path(pdf).read_bytes()
+    doc = shell._viewer.current_document
+    _commit_stroke(doc)
+
+    def _boom(_self, *_args, **_kwargs):
+        raise InvalidPdfError("simulated serialization failure")
+
+    monkeypatch.setattr(PdfBackend, "export_pdf_in_process", _boom)
+
+    assert shell._save_current() is False
+    assert doc.is_dirty, "a failed save must keep the unsaved state"
+    assert not doc.is_closed
+    assert not shell._viewer.is_loading()
+    assert shell._viewer.isEnabled()
+    assert QApplication.activeModalWidget() is None, (
+        "the busy dialog outlived the failed save")
+    assert Path(pdf).read_bytes() == original_bytes

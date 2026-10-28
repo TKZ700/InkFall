@@ -676,7 +676,8 @@ class Document:
             page_items.append(_annotation_export_items(annotations))
         return page_items
 
-    def write_export(self, target_path: str) -> None:
+    def write_export(self, target_path: str, *, progress=None,
+                     pump=None) -> None:
         """Write a complete, transactional PDF snapshot to disk.
 
         The authoritative manifest is serialized before touching any file.
@@ -684,6 +685,12 @@ class Document:
         and the backend verifies the result before atomic replacement. The
         live annotation store, undo history, and viewport are not modified;
         a failure leaves the session usable.
+
+        ``progress`` (optional) receives the backend's opaque stage names.
+        ``pump`` (optional) selects the process-backed export used by the
+        UI: it is an event-pumping wait primitive so Qt stays responsive
+        while the child process does the GIL-holding MuPDF work. Without
+        it the export runs synchronously in this process.
         """
         self._ensure_writable()
         if self._persistence_blocked:
@@ -713,9 +720,14 @@ class Document:
             except Exception as exc:
                 raise InvalidPdfError(
                     f"Cannot preserve PaperSpec metadata: {exc}") from exc
-        self._backend.export_pdf(
-            target_path, native_pages, manifest_bytes, self.page_count,
-            paper_keywords)
+        if pump is not None:
+            self._backend.export_pdf_in_process(
+                target_path, native_pages, manifest_bytes, self.page_count,
+                paper_keywords, progress=progress, pump=pump)
+        else:
+            self._backend.export_pdf(
+                target_path, native_pages, manifest_bytes, self.page_count,
+                paper_keywords, progress=progress)
 
     @property
     def id(self) -> DocumentId:

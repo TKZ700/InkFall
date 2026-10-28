@@ -14,6 +14,8 @@ from __future__ import annotations
 import errno
 import os
 import tempfile
+import time
+from queue import Empty
 
 import pymupdf
 
@@ -579,39 +581,12 @@ class PdfBackend:
         sampled before authenticating because PyMuPDF stops reporting it
         once access is granted.
         """
-        doc = pymupdf.open(snapshot_path)
-        try:
-            protected = bool(doc.needs_pass or doc.is_encrypted)
-            if doc.needs_pass:
-                if not self._password:
-                    raise EncryptedRewriteError(
-                        "The exported copy of this encrypted PDF requires a "
-                        "password that is not available; the save was "
-                        "refused and the original file is unchanged.")
-                try:
-                    ok = bool(doc.authenticate(self._password))
-                except Exception as exc:
-                    raise EncryptedRewriteError(
-                        "The exported copy of this encrypted PDF could not "
-                        "be authenticated; the save was refused and the "
-                        "original file is unchanged.") from exc
-                if not ok:
-                    raise EncryptedRewriteError(
-                        "The exported copy of this encrypted PDF could not "
-                        "be authenticated with the password used to open it; "
-                        "the save was refused and the original file is "
-                        "unchanged.")
-            return doc, protected
-        except Exception:
-            try:
-                doc.close()
-            except Exception:
-                pass
-            raise
+        return _open_export_snapshot(snapshot_path, self._password)
 
     def export_pdf(self, target_path: str, native_pages: list,
                    manifest_bytes: bytes, expected_page_count: int,
-                   expected_paper_keywords: str | None = None) -> None:
+                   expected_paper_keywords: str | None = None,
+                   *, progress=None) -> None:
         """Atomically write a verified PDF with native annotations + manifest.
 
         The export is built from a fresh snapshot of the live document,
@@ -666,6 +641,7 @@ class PdfBackend:
             os.remove(snapshot_path)
         except OSError:
             pass
+        _emit_progress(progress, "snapshot")
         try:
             self._doc.save(snapshot_path, encryption=_PDF_ENCRYPT_KEEP)
         except Exception as e:
@@ -708,20 +684,9 @@ class PdfBackend:
             except Exception:
                 original_attachments = ()
 
-            expected_markers: dict[int, list[str]] = {}
-            for index, specs in enumerate(native_pages or ()):
-                if not specs:
-                    continue
-                if index >= len(holder):
-                    raise NativeAnnotationError(
-                        f"Cannot save native annotations for page "
-                        f"{index + 1}: the exported document has "
-                        f"{len(holder)} pages.")
-                page = holder[index]
-                markers = [_add_native_annotation(page, spec)
-                           for spec in specs]
-                if markers:
-                    expected_markers[index] = markers
+            _emit_progress(progress, "annotations")
+            expected_markers = _apply_export_annotations(
+                holder, native_pages)
 
             _write_manifest_attachment(holder, manifest_bytes)
 
@@ -739,6 +704,7 @@ class PdfBackend:
             except OSError:
                 pass
             try:
+                _emit_progress(progress, "write")
                 holder.save(temp_path, garbage=3, deflate=True,
                             encryption=_PDF_ENCRYPT_KEEP)
             except Exception as exc:
@@ -757,6 +723,7 @@ class PdfBackend:
                     expected_permissions = int(self._doc.permissions)
                 except Exception:
                     expected_permissions = None
+            _emit_progress(progress, "verify")
             _verify_saved_pdf(
                 temp_path, expected_page_count, manifest_bytes,
                 expected_paper_keywords, original_attachments,
@@ -789,6 +756,7 @@ class PdfBackend:
                     except Exception:
                         pass
                 try:
+                    _emit_progress(progress, "replace")
                     _replace_target(temp_path, target_abs)
                 except Exception:
                     self._doc = replacement
@@ -801,6 +769,7 @@ class PdfBackend:
                 # it is deleted when the handle it backs closes (close()).
                 self._snapshot_pending = snapshot_path
             else:
+                _emit_progress(progress, "replace")
                 _replace_target(temp_path, target_abs)
             temp_path = None
         except InvalidPdfError:
@@ -841,6 +810,205 @@ class PdfBackend:
                         os.remove(snapshot_path)
                 except Exception:
                     pass
+
+    def export_pdf_in_process(self, target_path: str, native_pages: list,
+                              manifest_bytes: bytes, expected_page_count: int,
+                              expected_paper_keywords: str | None = None,
+                              *, progress=None, pump=None) -> None:
+        """Export through a spawned child process (the UI save path).
+
+        Same contract and integrity checks as :meth:`export_pdf`, but the
+        annotation insertion, the ``garbage=3``/deflate rewrite and the
+        verification run in a child process, because PyMuPDF holds the GIL
+        for an entire ``save`` call (a thread cannot keep Qt's event loop
+        alive). The parent still creates the snapshot (a fast plain copy),
+        performs the atomic replacement and installs the replacement
+        handle, so destination-lock classification and the live-document
+        handoff stay in-process.
+
+        ``pump`` is the UI's event-pumping wait: ``pump(poll)`` must call
+        ``poll() -> (done, payload)`` until done and return the final
+        payload. Without it the wait is a plain blocking loop.
+        """
+        self._ensure_open()
+        if not target_path or not isinstance(target_path, str):
+            raise ValueError(f"invalid save path: {target_path!r}")
+        if not isinstance(manifest_bytes, (bytes, bytearray)):
+            raise ValueError("manifest_bytes must be bytes")
+        manifest_bytes = bytes(manifest_bytes)
+        if not manifest_bytes:
+            raise ValueError("manifest_bytes must not be empty")
+        if isinstance(expected_page_count, bool) or not isinstance(
+                expected_page_count, int) or expected_page_count < 0:
+            raise ValueError("invalid expected page count")
+
+        self.ensure_export_supported()
+
+        fd, snapshot_path = tempfile.mkstemp(
+            prefix="inkfall-snapshot-", suffix=".pdf")
+        os.close(fd)
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+        _emit_progress(progress, "snapshot")
+        try:
+            self._doc.save(snapshot_path, encryption=_PDF_ENCRYPT_KEEP)
+        except Exception as e:
+            try:
+                if os.path.isfile(snapshot_path):
+                    os.remove(snapshot_path)
+            except Exception:
+                pass
+            if self._encrypted_at_open:
+                raise EncryptedRewriteError(
+                    _ENCRYPTED_REWRITE_MESSAGE) from e
+            raise InvalidPdfError(
+                f"Cannot snapshot document for save: {e}") from e
+
+        target_abs = os.path.abspath(os.path.expanduser(target_path))
+        target_dir = os.path.dirname(target_abs) or "."
+        same_target = _same_path(target_abs, self._path)
+        expected_permissions = None
+        if self._encrypted_at_open:
+            try:
+                expected_permissions = int(self._doc.permissions)
+            except Exception:
+                expected_permissions = None
+        job = {
+            "snapshot": snapshot_path,
+            "target": target_abs,
+            "target_dir": target_dir,
+            "native_pages": list(native_pages or ()),
+            "manifest": manifest_bytes,
+            "page_count": int(expected_page_count),
+            "paper_keywords": expected_paper_keywords,
+            "password": self._password,
+            "encrypted_at_open": bool(self._encrypted_at_open),
+            "permissions": expected_permissions,
+        }
+
+        temp_path = None
+        snapshot_pending = False
+        try:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                if _is_destination_lock_error(e):
+                    raise SaveLockedError(
+                        _unwritable_message(target_abs, e)) from e
+                raise InvalidPdfError(
+                    f"Cannot prepare save directory: {e}") from e
+
+            if same_target:
+                old_doc = self._doc
+                self._doc = None
+                try:
+                    old_doc.close()
+                except Exception:
+                    pass
+                retired, self._snapshot_pending = self._snapshot_pending, None
+                if retired is not None and retired != snapshot_path:
+                    try:
+                        if os.path.isfile(retired):
+                            os.remove(retired)
+                    except Exception:
+                        pass
+
+            result = self._run_export_process(
+                job, progress=progress, pump=pump)
+            if not result or not result.get("ok"):
+                raise _export_error_from_result(result or {})
+            temp_path = result.get("temp")
+            if not isinstance(temp_path, str) or not os.path.isfile(temp_path):
+                raise InvalidPdfError(
+                    "The save worker produced no output file.")
+            _emit_progress(progress, "replace")
+            _replace_target(temp_path, target_abs)
+            temp_path = None
+            if same_target:
+                replacement, _protected = self._open_snapshot(snapshot_path)
+                self._doc = replacement
+                self._snapshot_pending = snapshot_path
+                snapshot_pending = True
+        except InvalidPdfError:
+            raise
+        except Exception as e:
+            raise InvalidPdfError(
+                f"Cannot save PDF: {target_path} "
+                f"({type(e).__name__}: {e})") from e
+        finally:
+            if temp_path is not None:
+                try:
+                    if os.path.isfile(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+            if self._doc is None:
+                # A same-path failure must leave a usable live handle.
+                try:
+                    self._doc, _protected = self._open_snapshot(snapshot_path)
+                    self._snapshot_pending = snapshot_path
+                    snapshot_pending = True
+                except Exception:
+                    self._closed = True
+            if not snapshot_pending:
+                try:
+                    if os.path.isfile(snapshot_path):
+                        os.remove(snapshot_path)
+                except Exception:
+                    pass
+
+    def _run_export_process(self, job: dict, *, progress=None,
+                            pump=None) -> dict:
+        """Spawn the export child and wait for its result.
+
+        The child never touches the live handle; the parent keeps the GUI
+        thread free by polling the result queue inside ``pump`` (or by a
+        plain sleep loop for non-UI callers).
+        """
+        import multiprocessing
+
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_export_child_main, args=(job, result_queue),
+            name="inkfall-save")
+        try:
+            process.start()
+        except Exception as exc:
+            raise InvalidPdfError(
+                f"Cannot start the save worker: {exc}") from exc
+        try:
+            if pump is not None:
+                return pump(lambda: _poll_export_process(
+                    process, result_queue)) or {}
+            while True:
+                done, payload = _poll_export_process(process, result_queue)
+                stage = payload.get("stage") if payload else None
+                if stage:
+                    _emit_progress(progress, stage)
+                if done:
+                    return payload
+                time.sleep(0.05)
+        finally:
+            try:
+                process.join(20)
+            except Exception:
+                pass
+            if process.is_alive():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                try:
+                    process.join(5)
+                except Exception:
+                    pass
+            try:
+                result_queue.close()
+            except Exception:
+                pass
 
     def authenticate(self, password: str) -> bool:
         """Authenticate an encrypted document. Raises on failure."""
@@ -982,6 +1150,251 @@ def _is_destination_lock_error(exc: BaseException) -> bool:
             return True
         return exc.errno in _DESTINATION_LOCK_ERRNO
     return False
+
+
+def _emit_progress(progress, stage: str) -> None:
+    """Report a save stage to an optional listener; never fail the save.
+
+    Stages are opaque names ("snapshot", "annotations", "write", "verify",
+    "replace"); no document data or paths cross the callback boundary, so
+    it is safe to call from a save worker thread (the UI only emits a Qt
+    signal from it).
+    """
+    if progress is None:
+        return
+    try:
+        progress(stage)
+    except Exception:
+        pass
+
+
+def _open_export_snapshot(snapshot_path: str, password: str | None = None):
+    """Open an export snapshot file; authenticate if it kept encryption.
+
+    Shared by the parent backend and the save child process. Returns
+    ``(document, was_encrypted)``. The file must outlive the returned
+    handle (PyMuPDF keeps it open). The encryption state is sampled before
+    authenticating because PyMuPDF stops reporting it once access is
+    granted.
+    """
+    doc = pymupdf.open(snapshot_path)
+    try:
+        protected = bool(doc.needs_pass or doc.is_encrypted)
+        if doc.needs_pass:
+            if not password:
+                raise EncryptedRewriteError(
+                    "The exported copy of this encrypted PDF requires a "
+                    "password that is not available; the save was "
+                    "refused and the original file is unchanged.")
+            try:
+                ok = bool(doc.authenticate(password))
+            except Exception as exc:
+                raise EncryptedRewriteError(
+                    "The exported copy of this encrypted PDF could not "
+                    "be authenticated; the save was refused and the "
+                    "original file is unchanged.") from exc
+            if not ok:
+                raise EncryptedRewriteError(
+                    "The exported copy of this encrypted PDF could not "
+                    "be authenticated with the password used to open it; "
+                    "the save was refused and the original file is "
+                    "unchanged.")
+        return doc, protected
+    except Exception:
+        try:
+            doc.close()
+        except Exception:
+            pass
+        raise
+
+
+def _apply_export_annotations(holder, native_pages: list) -> dict:
+    """Insert the expected native annotations into ``holder``.
+
+    Returns the expected marker map used by verification. Shared by the
+    synchronous export and the save child process.
+    """
+    expected_markers: dict[int, list[str]] = {}
+    for index, specs in enumerate(native_pages or ()):
+        if not specs:
+            continue
+        if index >= len(holder):
+            raise NativeAnnotationError(
+                f"Cannot save native annotations for page "
+                f"{index + 1}: the exported document has "
+                f"{len(holder)} pages.")
+        page = holder[index]
+        markers = [_add_native_annotation(page, spec) for spec in specs]
+        if markers:
+            expected_markers[index] = markers
+    return expected_markers
+
+
+def _write_export_temp(holder, target_dir: str, target_abs: str) -> str:
+    """Write the annotated holder to a private temp file in ``target_dir``.
+
+    Kept beside the destination so the parent's ``os.replace`` stays on
+    one volume. Destination lock failures are classified here so the
+    child can report them without the parent having to re-derive them.
+    """
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".inkfall-save-", suffix=".pdf", dir=target_dir)
+    except Exception as e:
+        if _is_destination_lock_error(e):
+            raise SaveLockedError(_unwritable_message(target_abs, e)) from e
+        raise
+    os.close(fd)
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+    try:
+        holder.save(temp_path, garbage=3, deflate=True,
+                    encryption=_PDF_ENCRYPT_KEEP)
+    except Exception:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        raise
+    return temp_path
+
+
+def _export_error_kind(exc: BaseException) -> str:
+    """Map an export exception to a cross-process kind string."""
+    if isinstance(exc, SaveLockedError):
+        return "locked"
+    if isinstance(exc, EncryptedRewriteError):
+        return "encrypted"
+    if isinstance(exc, NativeAnnotationError):
+        return "native"
+    if isinstance(exc, SaveVerificationError):
+        return "verify"
+    return "other"
+
+
+def _export_error_from_result(result: dict) -> BaseException:
+    """Rebuild a typed export exception from the child's plain result."""
+    kind = result.get("kind") or "other"
+    message = result.get("message") or "Cannot save PDF"
+    if kind == "locked":
+        return SaveLockedError(message)
+    if kind == "encrypted":
+        return EncryptedRewriteError(message)
+    if kind == "native":
+        return NativeAnnotationError(message)
+    if kind == "verify":
+        return SaveVerificationError(message)
+    return InvalidPdfError(message)
+
+
+def _export_child_main(job: dict, result_queue) -> None:
+    """Child entry point: annotate + rewrite + verify one export.
+
+    Module-level so ``multiprocessing``'s ``spawn`` can pickle it. Receives
+    plain data only (paths, bytes, dicts) — never a live PyMuPDF handle —
+    and returns the verified temporary output path; the parent performs
+    the atomic replacement so destination-lock classification and the live
+    document handoff stay in one place. PyMuPDF holds the GIL for a whole
+    ``save`` call, which is exactly why this runs in a process and not on
+    a thread.
+    """
+    holder = None
+    temp_path = None
+    try:
+        holder, protected = _open_export_snapshot(
+            job["snapshot"], job.get("password"))
+        if job["encrypted_at_open"] and not protected:
+            raise EncryptedRewriteError(
+                "The exported copy of this encrypted PDF would lose its "
+                "protection. The save was refused and the original file "
+                "is unchanged.")
+        result_queue.put(("stage", "annotations"))
+        try:
+            original_attachments = tuple(holder.embfile_names() or ())
+        except Exception:
+            original_attachments = ()
+        markers = _apply_export_annotations(holder, job["native_pages"])
+        _write_manifest_attachment(holder, job["manifest"])
+        result_queue.put(("stage", "write"))
+        try:
+            temp_path = _write_export_temp(
+                holder, job["target_dir"], job["target"])
+        except Exception as exc:
+            text = str(exc).lower()
+            if job["encrypted_at_open"] and (
+                    "encrypt" in text or "password" in text):
+                raise EncryptedRewriteError(
+                    _ENCRYPTED_REWRITE_MESSAGE) from exc
+            raise
+        holder.close()
+        holder = None
+        result_queue.put(("stage", "verify"))
+        _verify_saved_pdf(
+            temp_path, job["page_count"], job["manifest"],
+            job["paper_keywords"], original_attachments,
+            expected_markers=markers,
+            password=job.get("password") if protected else None,
+            expect_encrypted=protected,
+            expected_permissions=(job.get("permissions")
+                                  if protected else None))
+        result_queue.put(("done", {"ok": True, "temp": temp_path}))
+        temp_path = None
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        result_queue.put(("done", {
+            "ok": False,
+            "kind": _export_error_kind(exc),
+            "message": str(exc) or type(exc).__name__,
+        }))
+    finally:
+        if holder is not None:
+            try:
+                holder.close()
+            except Exception:
+                pass
+        if temp_path is not None:
+            try:
+                if os.path.isfile(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+
+def _poll_export_process(proc, result_queue) -> tuple[bool, dict]:
+    """Non-blocking poll of one save child: ``(done, payload)``.
+
+    A non-final payload may carry ``{"stage": name}``; the final payload is
+    the child's result dict (``ok`` plus ``temp`` or an error descriptor).
+    A child that exits without reporting is a hard failure, never a lock.
+    """
+    stage = None
+    while True:
+        try:
+            kind, value = result_queue.get_nowait()
+        except Empty:
+            break
+        except (OSError, EOFError):
+            break
+        if kind == "stage":
+            stage = value
+        elif kind == "done":
+            return True, value
+    if not proc.is_alive():
+        # The feeder can flush just after the process exits.
+        try:
+            kind, value = result_queue.get(timeout=0.25)
+            if kind == "done":
+                return True, value
+        except (Empty, OSError, EOFError):
+            pass
+        return True, {
+            "ok": False, "kind": "crash",
+            "message": ("The save worker stopped unexpectedly "
+                        f"(exit code {proc.exitcode})."),
+        }
+    return False, ({"stage": stage} if stage else {})
 
 
 def _replace_target(temp_path: str, target_abs: str) -> None:

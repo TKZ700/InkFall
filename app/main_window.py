@@ -16,20 +16,31 @@ and inactive tabs keep their managed ``Document`` alive. The tab strip
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QEventLoop,
+    QObject,
+    QRunnable,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
+    QApplication,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QScrollBar,
     QStackedWidget,
     QVBoxLayout,
@@ -58,7 +69,7 @@ from document.backend import (
     SaveVerificationError,
 )
 from document.backend import enumerate_page_infos
-from document.errors import DocumentClosedError
+from document.errors import DocumentClosedError, InvalidPdfError
 from document.manager import BLANK_KEY_PREFIX, DocumentManager
 from library.models import strip_pdf_suffix
 from library.service import LibraryService
@@ -174,6 +185,57 @@ class _SwitchPrep(QRunnable):
             self._hub.done.emit(self._epoch, {
                 "ok": False, "pipeline": None, "zoom": self._zoom,
                 "error": str(exc) or exc.__class__.__name__})
+
+
+class _SaveHub(QObject):
+    """GUI-thread delivery point for one background save step.
+
+    Lives on the GUI thread (parented to the window); the pool thread
+    emits from there and Qt queues the signal, so the waiting loop always
+    resumes where widgets are touchable.
+    """
+
+    done = Signal(int, object)
+
+
+class _CallJob(QRunnable):
+    """Run one plain callable on the save pool and report its outcome.
+
+    Deliberately contains no Qt objects. Only the Qt-free save steps go
+    through it (working-copy materialization, pipeline rebind); the
+    export itself cannot use a thread because PyMuPDF holds the GIL for
+    the entire ``Document.save`` call, which is why it runs in a child
+    process instead (see :meth:`PdfBackend.export_pdf_in_process`).
+    """
+
+    def __init__(self, hub: _SaveHub, epoch: int, func) -> None:
+        super().__init__()
+        self._hub = hub
+        self._epoch = int(epoch)
+        self._func = func
+
+    def run(self) -> None:  # noqa: N802
+        try:
+            value = self._func()
+            result = {"ok": True, "value": value}
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the GUI thread
+            result = {"ok": False, "error": exc}
+        try:
+            self._hub.done.emit(self._epoch, result)
+        except Exception:
+            pass
+
+
+#: Human-readable progress labels for the backend's opaque stage names.
+_SAVE_STAGES = {
+    "prepare": "Preparing the document…",
+    "rebind": "Releasing the previous file…",
+    "snapshot": "Creating a snapshot…",
+    "annotations": "Writing annotations…",
+    "write": "Writing the PDF…",
+    "verify": "Verifying the saved file…",
+    "replace": "Replacing the file…",
+}
 
 
 class _PipelineClose(QRunnable):
@@ -340,6 +402,14 @@ class MainWindow(QMainWindow):
         self._switch_hub.done.connect(self._on_switch_prepared)
         self._switch_pool = QThreadPool(self)
         self._switch_pool.setMaxThreadCount(2)
+        # -- background saves: exclusive document handoff ------------------
+        # One save at a time. The worker owns the document's live handle
+        # for the duration; the GUI thread stays in a nested progress loop
+        # (window keeps painting, platform never marks it unresponsive).
+        self._save_pool = QThreadPool(self)
+        self._save_pool.setMaxThreadCount(1)
+        self._save_epoch = 0
+        self._save_in_flight = False
         try:
             self._viewer.set_pipeline_retirer(self._retire_pipeline_async)
         except Exception:
@@ -2887,24 +2957,43 @@ class MainWindow(QMainWindow):
                           allow_recovery: bool = False) -> bool:
         """Export ``doc`` to ``target`` and register the saved file.
 
-        With ``allow_recovery`` (ordinary Save only), a classified
+        The materialize + rebind + export + verify + replace work runs in
+        :meth:`_run_save_job` (pool thread for the Qt-free steps, child
+        process for the GIL-holding MuPDF export); this method still
+        returns only after the save finished, so Save All and the
+        close/exit guards keep their synchronous contracts. With
+        ``allow_recovery`` (ordinary Save only), a classified
         destination-write failure (:class:`SaveLockedError`) additionally
         offers the Save As copy flow. Serialization and invalid-document
         failures never trigger recovery.
         """
-        old_key = None
+        if getattr(self, "_save_in_flight", False):
+            try:
+                self._toast.show_message(
+                    "Save already in progress",
+                    "Wait for the current save to finish before saving again.",
+                    kind="info")
+            except Exception:
+                pass
+            return False
+        reading_key = None
         try:
-            old_key = doc.reading_key
+            reading_key = doc.reading_key
         except Exception:
-            old_key = None
+            reading_key = None
         try:
-            if doc is self._viewer.current_document:
-                self._viewer.prepare_document_save(doc, target)
-            normalized = self._manager.save_document(doc, target)
+            path_key, key = self._manager.begin_save(doc, target)
+            self._run_save_job(doc, target)
         except Exception as exc:
             self._report_save_failure(exc)
             if allow_recovery and isinstance(exc, SaveLockedError):
                 return self._offer_save_as_recovery(doc, exc)
+            return False
+        try:
+            normalized = self._manager.complete_save(
+                doc, target, path_key, key)
+        except Exception as exc:
+            self._report_save_failure(exc)
             return False
         # The export succeeded: reset the dirty baseline (undo stack
         # clean index + document flag) before anything reads it.
@@ -2915,13 +3004,13 @@ class MainWindow(QMainWindow):
         if doc is self._viewer.current_document:
             try:
                 self._viewer.persist_reading_position(
-                    migrate_from=old_key)
+                    migrate_from=reading_key)
             except Exception:
                 pass
-        elif old_key:
+        elif reading_key:
             try:
                 self._viewer.migrate_reading_position(
-                    old_key, doc.reading_key)
+                    reading_key, doc.reading_key)
             except Exception:
                 pass
         try:
@@ -2938,6 +3027,185 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         return True
+
+    def _run_save_job(self, doc, target: str) -> None:
+        """Save ``doc`` to ``target`` without freezing the GUI thread.
+
+        Each step runs where its blocking work actually happens:
+
+        1. ``prepare_for_save`` materializes the sanitized working copy
+           used by the renderer (same-path saves) on the save pool.
+        2. The live pipeline is rebound to that copy on the save pool,
+           BEFORE the export replaces the destination: this is what
+           releases the source file (Windows sharing violation otherwise)
+           and it is the second-largest stall after the export itself
+           (~5.5 s of decoder-process joins), so it cannot stay on the
+           GUI thread either.
+        3. The export (annotate + rewrite + verify + atomic replace) runs
+           in a spawned child process. PyMuPDF holds the GIL for the whole
+           ``Document.save`` call, so a pool *thread* cannot keep Qt's
+           event loop alive (measured: one loop iteration in 0.97 s); the
+           child is polled here while Qt events are pumped.
+
+        The window-modal busy dialog blocks user input and the active
+        document's canvas is in the existing loading state (paint returns
+        early, render timer stopped), which keeps the pool thread away
+        from a pipeline the GUI is drawing. Registry changes and
+        ``commit_saved`` still happen on the GUI thread after this
+        returns, so a failure keeps the session dirty and intact.
+        """
+        dialog = None
+        entered_loading = False
+        self._save_in_flight = True
+        self._save_dialog = None
+        try:
+            try:
+                active = doc is self._viewer.current_document
+            except Exception:
+                active = False
+            if active:
+                try:
+                    if not self._viewer.is_loading():
+                        self._viewer.enter_loading(self._tab_title_for(doc))
+                        entered_loading = True
+                except Exception:
+                    entered_loading = False
+            try:
+                dialog = QProgressDialog(
+                    f"Saving {self._suggested_save_name(doc)}", "", 0, 0,
+                    self)
+                dialog.setWindowTitle("Saving PDF")
+                dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                dialog.setCancelButton(None)
+                dialog.setMinimumDuration(0)
+                dialog.setAutoClose(False)
+                dialog.setAutoReset(False)
+                dialog.setWindowFlag(
+                    Qt.WindowType.WindowCloseButtonHint, False)
+                dialog.setLabelText(_SAVE_STAGES["prepare"])
+                dialog.show()
+                self._save_dialog = dialog
+            except Exception:
+                dialog = None
+                self._save_dialog = None
+
+            self._run_pool_blocking(
+                lambda: doc.prepare_for_save(target))
+
+            try:
+                plan = self._viewer.save_rebind_plan(doc)
+            except Exception:
+                plan = None
+            if plan is not None:
+                pipeline, render_path = plan
+                self._show_save_stage("rebind")
+                self._run_pool_blocking(
+                    lambda: pipeline.rebind_source(render_path))
+                try:
+                    self._viewer.finish_save_rebind()
+                except Exception:
+                    pass
+
+            doc.write_export(target, progress=self._show_save_stage,
+                             pump=self._process_pump)
+        finally:
+            self._save_in_flight = False
+            self._save_dialog = None
+            if dialog is not None:
+                try:
+                    dialog.close()
+                    dialog.deleteLater()
+                except Exception:
+                    pass
+            if entered_loading:
+                try:
+                    self._viewer.exit_loading()
+                except Exception:
+                    pass
+
+    def _run_pool_blocking(self, func):
+        """Run ``func`` on the save pool; re-raise its failure here.
+
+        The GUI thread waits in a nested event loop instead of blocking on
+        the pool thread, so timers and window paint keep flowing and the
+        platform never marks the window as unresponsive. The callable is
+        Qt-free by contract (document materialization, pipeline rebind).
+        """
+        self._save_epoch += 1
+        epoch = self._save_epoch
+        hub = _SaveHub(self)
+        state: dict = {}
+        loop = QEventLoop(self)
+
+        def _on_done(_epoch: int, result) -> None:
+            if _epoch != epoch:
+                return
+            state.update(result or {})
+            loop.quit()
+
+        hub.done.connect(_on_done)
+        try:
+            self._save_pool.start(_CallJob(hub, epoch, func))
+            loop.exec()
+        finally:
+            try:
+                hub.done.disconnect(_on_done)
+            except Exception:
+                pass
+        if not state:
+            raise InvalidPdfError(
+                "Saving was interrupted before it completed; the document "
+                "and the original file are unchanged.")
+        if not state.get("ok"):
+            error = state.get("error")
+            if isinstance(error, BaseException):
+                raise error
+            raise InvalidPdfError("The save did not complete.")
+        return state.get("value")
+
+    def _process_pump(self, poll):
+        """``Document.write_export`` pump hook for the UI save path."""
+        return self._pump_until(poll, self._show_save_stage)
+
+    def _pump_until(self, poll, on_stage=None):
+        """Wait for ``poll`` while keeping Qt's event loop alive.
+
+        ``poll`` is the backend's non-blocking child-process poll
+        (``poll() -> (done, payload)``); a payload may carry a ``stage``
+        name, forwarded to ``on_stage`` for the progress label. This is
+        deliberately a nested wait, not a blocking join: the child owns
+        the GIL-holding MuPDF work, so pumping here is exactly what keeps
+        the window painting and the platform from flagging it
+        unresponsive.
+        """
+        app = QApplication.instance()
+        while True:
+            done, payload = poll()
+            if payload:
+                stage = payload.get("stage")
+                if stage and on_stage is not None:
+                    try:
+                        on_stage(stage)
+                    except Exception:
+                        pass
+            if done:
+                return payload
+            if app is not None:
+                app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+            time.sleep(0.01)
+
+    def _show_save_stage(self, stage: str) -> None:
+        """Update the busy dialog's label for one backend stage name."""
+        dialog = getattr(self, "_save_dialog", None)
+        if dialog is None:
+            return
+        label = _SAVE_STAGES.get(str(stage))
+        if not label:
+            return
+        try:
+            dialog.setLabelText(label)
+        except Exception:
+            pass
 
     # -- per-tab close guard (Phase 2) ---------------------------------------
 
@@ -3446,6 +3714,13 @@ class MainWindow(QMainWindow):
                 # Pipelines handed to the background pool during the
                 # session are drained before the store closes.
                 self._switch_pool.waitForDone(10000)
+            except Exception:
+                pass
+            try:
+                # A save worker must never outlive the documents it owns.
+                # The modal progress loop prevents a close during a save;
+                # this drain is the belt-and-braces guarantee.
+                self._save_pool.waitForDone(30000)
             except Exception:
                 pass
             try:

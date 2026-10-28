@@ -1608,26 +1608,55 @@ class PdfViewer(QWidget):
             pass
 
     def prepare_document_save(self, doc, target_path: str) -> None:
-        """Detach an active source renderer before a same-path save."""
+        """Detach an active source renderer before a same-path save.
+
+        Synchronous convenience for non-UI callers. The UI save path uses
+        :meth:`save_rebind_plan` + :meth:`finish_save_rebind` instead, so
+        the rebind (which joins decoder processes, seconds on a large
+        document) can run off the GUI thread.
+        """
         if doc is None:
             return
-        changed = doc.prepare_for_save(target_path)
-        if doc is not self._document or self._pipeline is None:
+        doc.prepare_for_save(target_path)
+        plan = self.save_rebind_plan(doc)
+        if plan is None:
             return
-        needs_rebind = bool(changed)
-        if not needs_rebind:
+        pipeline, render_path = plan
+        pipeline.rebind_source(render_path)
+        self.finish_save_rebind()
+
+    def save_rebind_plan(self, doc):
+        """Return ``(pipeline, render_path)`` when a save must rebind.
+
+        Called on the GUI thread after ``Document.prepare_for_save``; it
+        only reads viewer state. The returned work is Qt-free
+        (``pipeline.rebind_source`` releases the old engine and joins the
+        process-decoder children) and may therefore run on a worker
+        thread. ``None`` means the pipeline already reads the document's
+        current render path (no rebind needed).
+        """
+        if doc is None or doc is not self._document or self._pipeline is None:
+            return None
+        pipeline = self._pipeline
+        try:
+            render_path = doc.render_path
+            if not render_path:
+                return None
+            current = os.path.normcase(os.path.abspath(pipeline.source_path))
+            target = os.path.normcase(os.path.abspath(render_path))
+        except Exception:
             try:
-                needs_rebind = (
-                    os.path.normcase(os.path.abspath(
-                        self._pipeline.source_path))
-                    != os.path.normcase(os.path.abspath(
-                        doc.render_path)))
+                return (pipeline, doc.render_path)
             except Exception:
-                needs_rebind = True
-        if needs_rebind:
-            self._pipeline.rebind_source(doc.render_path)
-            self._request_update()
-            self.update()
+                return None
+        if current == target:
+            return None
+        return (pipeline, render_path)
+
+    def finish_save_rebind(self) -> None:
+        """Refresh the canvas after a (possibly background) save rebind."""
+        self._request_update()
+        self.update()
 
     def _restore_reading_position(self, payload) -> None:
         if not payload or self._pipeline is None:

@@ -140,18 +140,14 @@ class DocumentManager:
         self._by_path[key] = doc.id.value
         return doc
 
-    def save_document(self, doc: Document, target_path: str) -> str:
-        """Export a session to ``target_path`` and adopt the file identity.
+    def begin_save(self, doc: Document, target_path: str) -> tuple[str, str]:
+        """Validate a save and resolve its registry keys (GUI thread).
 
-        The export is a full, verified snapshot (template + native
-        annotations + versioned manifest) built from the live in-memory
-        document. An opened PDF saves back to its source path; a blank
-        adopts the chosen destination. The session stays open and keeps
-        editing with its existing backend, store, history, and private
-        render working copy. On success the registry key moves to the
-        normalized target path and the document records ``saved_path``.
-        A failure raises before any identity change, so the workspace
-        stays dirty and intact.
+        Performs every identity/ownership guard the save path needs before
+        any file work starts, and returns ``(old_key, key)`` for
+        :meth:`complete_save`. Deliberately performs no export I/O: the
+        materialization and export run on the save worker, while the
+        registry is only mutated back on the GUI thread.
         """
         if doc is None or doc.is_closed:
             raise DocumentClosedError("Cannot save a closed document")
@@ -168,16 +164,48 @@ class DocumentManager:
             raise ValueError(
                 doc.persistence_error
                 or "This document cannot be saved safely.")
-        # The viewer normally performs this before manager.save_document so
-        # it can rebind the active render pipeline. Doing it here as well
-        # covers non-active documents during Save All; it is idempotent.
-        doc.prepare_for_save(target_path)
-        doc.write_export(target_path)
+        return old_key, key
+
+    def complete_save(self, doc: Document, target_path: str,
+                      old_key: str, key: str) -> str:
+        """Adopt the saved identity after a successful export (GUI thread).
+
+        Moves the registry key, records ``saved_path`` and clears the dirty
+        flags. Called only after the worker verified and replaced the
+        output; failures never reach here, so the workspace stays dirty
+        and intact exactly like the synchronous path.
+        """
         if self._by_path.get(old_key) == doc.id.value:
             self._by_path.pop(old_key, None)
         self._by_path[key] = doc.id.value
         doc.commit_saved(key, target_path)
         return key
+
+    def save_document(self, doc: Document, target_path: str) -> str:
+        """Export a session to ``target_path`` and adopt the file identity.
+
+        The export is a full, verified snapshot (template + native
+        annotations + versioned manifest) built from the live in-memory
+        document. An opened PDF saves back to its source path; a blank
+        adopts the chosen destination. The session stays open and keeps
+        editing with its existing backend, store, history, and private
+        render working copy. On success the registry key moves to the
+        normalized target path and the document records ``saved_path``.
+        A failure raises before any identity change, so the workspace
+        stays dirty and intact.
+
+        The UI runs the export half on a worker thread and calls
+        :meth:`begin_save`/:meth:`complete_save` around it; this
+        synchronous composition remains the single-threaded contract used
+        by tests and non-UI callers.
+        """
+        old_key, key = self.begin_save(doc, target_path)
+        # The viewer normally performs this before manager.save_document so
+        # it can rebind the active render pipeline. Doing it here as well
+        # covers non-active documents during Save All; it is idempotent.
+        doc.prepare_for_save(target_path)
+        doc.write_export(target_path)
+        return self.complete_save(doc, target_path, old_key, key)
 
     def close(self, document_id: DocumentId) -> None:
         """Close one document and remove it from the registry (idempotent).

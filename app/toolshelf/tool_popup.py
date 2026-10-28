@@ -547,6 +547,7 @@ class _QmlColorCard(QWidget):
         super().__init__(parent)
         self._tokens = tokens
         self._view = None
+        self._forwarding = False
         self._bridge = None
         self._theme_bridge = None
         try:
@@ -697,20 +698,35 @@ class _QmlColorCard(QWidget):
     # -- pointer forwarding (QTest/compat: presses on the card land on
     # the inner Quick view, which delivers them to the QML MouseArea) --
     def _forward_to_view(self, event) -> None:
-        try:
-            view = self._view
-            if view is None:
-                return
-            from PySide6.QtCore import QCoreApplication as _CA
-
-            pos = view.mapFrom(self, event.position().toPoint())
-            clone = type(event)(
-                event.type(), pos, event.globalPosition().toPoint(),
-                event.button(), event.buttons(), event.modifiers())
-            _CA.sendEvent(view, clone)
+        # Re-entry guard: when the QML scene does not take the event (a
+        # drag over non-interactive padding, a press before the scene
+        # grabs), the QQuickWidget ignores it and Qt propagates it back
+        # UP to this card — forwarding it down again looped
+        # mouseMoveEvent <-> _forward_to_view until the native stack
+        # died (packaged picker crash, inkfall-fatal-12176.log). The
+        # propagated copy is an event we already delivered to the
+        # scene: accept it and stop.
+        if getattr(self, "_forwarding", False):
             event.accept()
-        except Exception:
-            pass
+            return
+        self._forwarding = True
+        try:
+            try:
+                view = self._view
+                if view is None:
+                    return
+                from PySide6.QtCore import QCoreApplication as _CA
+
+                pos = view.mapFrom(self, event.position().toPoint())
+                clone = type(event)(
+                    event.type(), pos, event.globalPosition().toPoint(),
+                    event.button(), event.buttons(), event.modifiers())
+                _CA.sendEvent(view, clone)
+                event.accept()
+            except Exception:
+                pass
+        finally:
+            self._forwarding = False
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self._view is not None:
@@ -5473,8 +5489,16 @@ class ToolPopup(QWidget):
                             and watched is not parent):
                         pos = watched.mapTo(
                             parent, event.position().toPoint())
+                        # The 4-arg QMouseEvent ctor leaves the global
+                        # position invalid ((8388608, 8388608)); any
+                        # downstream consumer that clones or maps the
+                        # mirrored move would propagate that garbage.
+                        # Compute the real screen position instead.
+                        gpos = watched.mapToGlobal(
+                            event.position().toPoint())
                         fwd = QMouseEvent(
                             QEvent.Type.MouseMove, _QPointF(pos),
+                            _QPointF(gpos),
                             Qt.MouseButton.NoButton,
                             Qt.MouseButton.NoButton, event.modifiers())
                         QApplication.sendEvent(parent, fwd)
