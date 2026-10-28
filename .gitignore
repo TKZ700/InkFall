@@ -44,6 +44,8 @@ htmlcov/
 .coverage.*
 .cache
 .zcode
+# Mimosa security-hook local state (ZCode plugin; never commit)
+.mimosa/
 nosetests.xml
 coverage.xml
 *.cover
