@@ -71,15 +71,15 @@ def test_windows_installer_creates_both_shortcuts() -> None:
 
 
 def test_project_version_is_preview_version() -> None:
-    assert project_version() == "0.1.0"
+    assert project_version() == "0.1.1"
 
 
 def test_artifact_names_are_exact() -> None:
     version = project_version()
     assert windows_installer_name(version) == (
-        "Inkfall-0.1.0-windows-x86_64-setup.exe")
-    assert linux_archive_name(version) == "inkfall-0.1.0-linux-x86_64.tar.gz"
-    assert linux_archive_root(version) == "inkfall-0.1.0-linux-x86_64"
+        "Inkfall-0.1.1-windows-x86_64-setup.exe")
+    assert linux_archive_name(version) == "inkfall-0.1.1-linux-x86_64.tar.gz"
+    assert linux_archive_root(version) == "inkfall-0.1.1-linux-x86_64"
 
 
 def test_artifact_paths_use_version_and_dist_dir(tmp_path: Path) -> None:
@@ -314,10 +314,10 @@ def test_missing_current_brand_asset_fails_standalone_verification(
 
 
 def test_archive_required_entries_include_launcher() -> None:
-    entries = required_entries("linux", "inkfall-0.1.0-linux-x86_64")
-    assert "inkfall-0.1.0-linux-x86_64/inkfall" in entries
-    assert "inkfall-0.1.0-linux-x86_64/Inkfall" in entries
-    assert all("inkfall-0.1.0-linux-x86_64/" in entry for entry in entries)
+    entries = required_entries("linux", "inkfall-0.1.1-linux-x86_64")
+    assert "inkfall-0.1.1-linux-x86_64/inkfall" in entries
+    assert "inkfall-0.1.1-linux-x86_64/Inkfall" in entries
+    assert all("inkfall-0.1.1-linux-x86_64/" in entry for entry in entries)
 
 
 def test_linux_build_code_never_mentions_deb_or_rpm() -> None:
@@ -372,9 +372,9 @@ def test_release_tag_mismatch_is_rejected() -> None:
 @pytest.mark.parametrize(
     "tag",
     [
-        "0.1.0",  # exact version but missing the v prefix
-        "release-0.1.0",  # wrong prefix
-        "V0.1.0",  # tags are case-sensitive; only lowercase v is a tag
+        "0.1.1",  # exact version but missing the v prefix
+        "release-0.1.1",  # wrong prefix
+        "V0.1.1",  # tags are case-sensitive; only lowercase v is a tag
         "v",  # prefix with an empty version body
         "",  # not a tag at all
     ],

@@ -7,7 +7,7 @@ name: Build preview artifacts
 # Manual runs upload both files as workflow artifacts (not a GitHub
 # Release). Pull requests and branch pushes build and smoke-test only.
 #
-# Pushing a version tag (v<version>, e.g. v0.1.0) additionally publishes
+# Pushing a version tag (v<version>, e.g. v0.1.1) additionally publishes
 # a GitHub Release with both artifacts after BOTH builds succeed. A tag
 # push publishes binaries publicly: clear the release-readiness gate in
 # RELEASING.md first — the open obligations in THIRD_PARTY_NOTICES.md

@@ -1,6 +1,6 @@
 # Building Inkfall
 
-This document covers producing the `0.1.0` preview artifacts: a Windows x64
+This document covers producing the `0.1.1` preview artifacts: a Windows x64
 NSIS setup installer and a Linux x86_64 standalone `.tar.gz`.
 
 Builds are **native-only**. Nuitka compiles C against the host toolchain and
@@ -18,11 +18,11 @@ it and derives everything else:
 | Windows setup installer | `Inkfall-<version>-windows-x86_64-setup.exe` |
 | Linux archive | `inkfall-<version>-linux-x86_64.tar.gz` |
 
-For `0.1.0`:
+For `0.1.1`:
 
 ```
-dist/Inkfall-0.1.0-windows-x86_64-setup.exe
-dist/inkfall-0.1.0-linux-x86_64.tar.gz
+dist/Inkfall-0.1.1-windows-x86_64-setup.exe
+dist/inkfall-0.1.1-linux-x86_64.tar.gz
 ```
 
 ## Python dependencies
@@ -276,8 +276,8 @@ Workflow: `.github/workflows/build.yml` (**Build preview artifacts**).
 
 | Job | Runner | Output |
 |---|---|---|
-| `windows-installer` | `windows-2022` | `Inkfall-0.1.0-windows-x86_64-setup.exe` |
-| `linux-archive` | `ubuntu-24.04` | `inkfall-0.1.0-linux-x86_64.tar.gz` |
+| `windows-installer` | `windows-2022` | `Inkfall-0.1.1-windows-x86_64-setup.exe` |
+| `linux-archive` | `ubuntu-24.04` | `inkfall-0.1.1-linux-x86_64.tar.gz` |
 | `publish-release` | `ubuntu-24.04` | GitHub Release with both files (version tags only) |
 
 Triggers:
@@ -285,7 +285,7 @@ Triggers:
 - `workflow_dispatch` — manual run; uploads both artifacts.
 - `pull_request` — builds and smoke-tests, uploads nothing.
 - `push` to `main` — builds and smoke-tests, uploads nothing.
-- `push` of a version tag `v<version>` (e.g. `v0.1.0`) — the same two
+- `push` of a version tag `v<version>` (e.g. `v0.1.1`) — the same two
   builds, plus the `publish-release` job described below.
 
 Each job uses `uv sync --locked --group build`, i.e. the same lockfile and

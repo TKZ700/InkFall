@@ -179,8 +179,8 @@ def validate_release_tag(tag: str, *, source_root: Path = SOURCE_ROOT) -> str:
     """Check that a ``v<version>`` release tag encodes the project version.
 
     Release automation may only publish binaries under a tag whose version
-    matches ``pyproject.toml`` exactly (tag ``v0.1.0`` for version
-    ``0.1.0``). Anything else fails loudly instead of publishing a pairing
+    matches ``pyproject.toml`` exactly (tag ``v0.1.1`` for version
+    ``0.1.1``). Anything else fails loudly instead of publishing a pairing
     of one version's tag with another version's artifacts. Returns the
     validated version string.
 

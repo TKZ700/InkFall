@@ -5,7 +5,7 @@ Windows and Linux. It pairs a continuous PDF reader with a responsive
 handwriting canvas, hold-to-recognize smart shapes, and a Library built
 around organizing the documents you actually study.
 
-> **Status: `0.1.0` early public preview.**
+> **Status: `0.1.1` early public preview.**
 > The feature scope for this preview is implemented in source, but the
 > project is not release-ready: no binary has been published, the
 > third-party notice and redistribution obligations tracked in
@@ -119,7 +119,7 @@ release:
    artifacts** workflow.
 2. Run it with **Run workflow** (or open a completed manual run).
 3. Download the `inkfall-windows-x86_64` artifact and extract
-   `Inkfall-0.1.0-windows-x86_64-setup.exe`.
+   `Inkfall-0.1.1-windows-x86_64-setup.exe`.
 4. Run the installer. It installs for the current user only (no
    administrator rights and no UAC prompt) and creates Desktop and
    Start Menu shortcuts for that user.
@@ -144,8 +144,8 @@ if you trust the build source. A signed installer is future work.
 The Linux artifact is a standalone archive, not a distribution package:
 
 ```sh
-tar -xzf inkfall-0.1.0-linux-x86_64.tar.gz
-cd inkfall-0.1.0-linux-x86_64
+tar -xzf inkfall-0.1.1-linux-x86_64.tar.gz
+cd inkfall-0.1.1-linux-x86_64
 ./inkfall
 ```
 
@@ -188,8 +188,8 @@ Outputs (with the version taken from `pyproject.toml`):
 
 | Platform | File |
 |---|---|
-| Windows | `dist/Inkfall-0.1.0-windows-x86_64-setup.exe` |
-| Linux | `dist/inkfall-0.1.0-linux-x86_64.tar.gz` |
+| Windows | `dist/Inkfall-0.1.1-windows-x86_64-setup.exe` |
+| Linux | `dist/inkfall-0.1.1-linux-x86_64.tar.gz` |
 
 The command for the other platform fails fast with an explanation rather
 than producing a broken artifact. See [BUILDING.md](BUILDING.md) for

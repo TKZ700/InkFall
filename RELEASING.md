@@ -8,7 +8,7 @@ before one is allowed to happen.
 1. `pyproject.toml` holds the project version; it is the single source of
    truth (`scripts/build_config.py` reads it and derives every artifact
    name from it).
-2. Pushing a tag `v<version>` (for example `v0.1.0`) triggers
+2. Pushing a tag `v<version>` (for example `v0.1.1`) triggers
    `.github/workflows/build.yml`:
    - the Windows installer job and the Linux archive job run exactly as
      for any other push: focused build tests → Nuitka build → bundle
@@ -20,11 +20,11 @@ before one is allowed to happen.
      the existing tag and uploads both files as release assets with
      GitHub-generated release notes.
 3. Release assets (exact names, from `scripts/build_config.py`), for
-   example for `v0.1.0`:
+   example for `v0.1.1`:
 
    ```
-   Inkfall-0.1.0-windows-x86_64-setup.exe
-   inkfall-0.1.0-linux-x86_64.tar.gz
+   Inkfall-0.1.1-windows-x86_64-setup.exe
+   inkfall-0.1.1-linux-x86_64.tar.gz
    ```
 
 4. While the project is an early preview (see the status callout in
@@ -42,8 +42,8 @@ publish anything; they upload ephemeral 14-day workflow artifacts only.
 The tag must be exactly `v` followed by the version in `pyproject.toml`.
 All three jobs verify this (`scripts.build_config.validate_release_tag`)
 and the run fails before anything is published if they disagree. A tag
-such as `v0.2.0` while `pyproject.toml` says `0.1.0` cannot release, and a
-tag like `v0.1.0-rc1` is rejected the same way — bump the project version
+such as `v0.2.0` while `pyproject.toml` says `0.1.1` cannot release, and a
+tag like `v0.1.1-rc1` is rejected the same way — bump the project version
 first if you want a differently spelled release.
 
 ## Release-readiness gate — read this before pushing any `v*` tag
@@ -85,7 +85,7 @@ Do not push a `v*` tag until every item above is closed and updated in
   asset upload) is a deliberate, manual step:
   1. Look at the release page and confirm what actually happened.
   2. Delete only the incomplete release:
-     `gh release delete v0.1.0 --yes` (this keeps the `v0.1.0` git tag).
+     `gh release delete v0.1.1 --yes` (this keeps the `v0.1.1` git tag).
   3. Re-run the failed jobs from the Actions run for the tag
      (Actions → Build preview artifacts → the tag run → Re-run failed
      jobs); the rebuild then publishes normally.

@@ -3,6 +3,33 @@
 All notable changes to this preview are recorded here. The project version
 lives in `pyproject.toml`; entries below use that version.
 
+## 0.1.1 — alpha
+
+Stability, build and save-flow fixes.
+
+### Build and packaging
+
+- Fixed the Windows Nuitka build failing with MSVC error `C1002` (compiler
+  out of heap space) on the giant `pymupdf.mupdf` translation unit: the
+  `pymupdf` package is now included as frozen bytecode
+  (`--noinclude-custom-mode=pymupdf:bytecode`) while the native
+  `_mupdf.pyd`/`mupdfcpp64.dll` binaries ship unchanged.
+
+### Application fixes
+
+- Fixed the ColorPicker popup crash and a crash when saving large PDFs.
+- Saving large PDFs is faster: a save reuses the document's current render
+  work copy as the export snapshot instead of writing a second full
+  serialization, and queued page-decode work is withdrawn before a
+  pipeline rebind instead of being drained to completion.
+- Inkfall now asks other running Inkfall instances editing the same file
+  to release it before a save (with save/discard/cancel there for unsaved
+  changes); a refusal or timeout surfaces through the existing save-lock
+  recovery flow instead of racing the peer's write.
+- Helper processes (page-decode workers, the save child) can no longer
+  outlive a crashed instance: the app joins a Windows Job Object with
+  kill-on-close, and non-Windows children carry parent-death guards.
+
 ## 0.1.0 — preview (not yet published)
 
 First preview build of Inkfall as a packaged desktop application.
