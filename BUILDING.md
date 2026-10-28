@@ -338,7 +338,7 @@ public downloads come from GitHub Releases created by the
 | `Nuitka is not installed` | run `uv sync --group build` |
 | `cannot build the <platform> artifact on host …` | build on that platform (or use CI); cross-compilation is unsupported |
 | `missing native build tools: patchelf` | install `patchelf` (Linux) |
-| `fatal error C1002: compiler is out of heap space in pass 2` (Windows) | MSVC cl.exe exhausted its optimizer heap on a large generated TU (`numpy`/`pymupdf`). The shared build config already passes `--low-memory` on Windows, which implies a single C compiler job in Nuitka 4.3.1; if a hand-written invocation hits this, add `--low-memory` (not `-j`, which alone does not reduce per-process heap use) |
+| `fatal error C1002: compiler is out of heap space in pass 2` (Windows) | MSVC cl.exe exhausted its optimizer heap on a large generated TU. For `pymupdf` this is structural: the SWIG-generated `pymupdf.mupdf` module compiles into a ~2.4M-line C file that no `--jobs`/`--low-memory` setting can shrink, so the shared build config includes the whole `pymupdf` package as frozen bytecode (`--noinclude-custom-mode=pymupdf:bytecode`, Windows only) — the module ships and imports normally, just never as a C translation unit. `--low-memory` is also passed to bound C-compilation fan-out; if a hand-written invocation still hits C1002 on another TU, add `--low-memory` (not `-j` alone) or `--clang` |
 | NSIS download fails | install NSIS 3.x and point Nuitka at it |
 | `the standalone build is incomplete; missing: …` | a resource or Qt plugin was not bundled; check the Nuitka log in `build/logs/` |
 | self-test fails on QML | Qt Quick Controls modules missing from the bundle; inspect `build/smoke/self-test.json` |

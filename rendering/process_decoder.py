@@ -116,6 +116,11 @@ def _run_decode(handles, msg):  # type: ignore[no-untyped-def]
 
 def _worker_main(task_queue, result_queue):  # type: ignore[no-untyped-def]
     """Child entry point. Module-level so ``spawn`` can pickle it."""
+    from core.proc_lifetime import install_child_guard
+
+    # Non-Windows backstop so a crashed parent cannot orphan a worker
+    # blocked in task_queue.get() (Windows covers this via the job object).
+    install_child_guard()
     from rendering.workers import WorkerHandles
 
     handles = WorkerHandles()

@@ -54,6 +54,8 @@ from app.settings_panel import SettingsModal
 from app.new_blank_modal import BlankPreferencesModal
 from app.new_panel import NewModal
 from app.duplicate_open_modal import DuplicateOpenModal
+from app.instance_hub import InstanceHub
+from core.instance_registry import normalize_key, scan_instances
 from app.theme.manager import ThemeManager
 from app.thumbnails.service import ThumbnailService
 from app.titlebar import CONTROL_W, TITLE_BAR_H, TitleBar
@@ -479,6 +481,22 @@ class MainWindow(QMainWindow):
         self._duplicate_modal.readonlyRequested.connect(self._on_duplicate_readonly)
         self._duplicate_target_session = None
         self._duplicate_target_path = None
+        # Cross-instance coordination: this window advertises its open
+        # documents and answers release-requests from other InkFall
+        # windows saving the same canonical file. Refusals/timeouts flow
+        # into the ordinary SaveLockedError recovery during saves. A hub
+        # that cannot start (exotic environment) must never break the
+        # window: every consumer tolerates a None hub and saves fall
+        # back to the ordinary destination-lock handling.
+        self._instance_hub = None
+        self._instance_release_saving = False
+        try:
+            hub = InstanceHub(self)
+            hub.releaseRequested.connect(self._on_instance_release_request)
+            self._instance_hub = hub
+            self._publish_instance_docs()
+        except Exception:
+            self._instance_hub = None
         self._settings_fab.clicked.connect(self.toggle_settings_panel)
         self._position_fab()
         shell_layout.addWidget(content, stretch=1)
@@ -1235,6 +1253,7 @@ class MainWindow(QMainWindow):
                 active=active)
         except Exception:
             pass
+        self._publish_instance_docs()
         return session
 
     def _drop_session(self, session: _TabSession) -> None:
@@ -1263,6 +1282,7 @@ class MainWindow(QMainWindow):
             self._active_session = None
         if self._pending_open_fallback is session:
             self._pending_open_fallback = None
+        self._publish_instance_docs()
 
     def _sync_tab_titles(self) -> None:
         """Push titles and dirty dots for every tab (in place, no rebuild)."""
@@ -2000,6 +2020,163 @@ class MainWindow(QMainWindow):
                 self.show_library()
             return
         self._close_session(session)
+
+    # -- cross-instance same-file coordination -------------------------------
+
+    _INSTANCE_RELEASE_TIMEOUT_S = 60.0
+
+    def _publish_instance_docs(self) -> None:
+        """Advertise this window's open documents to other InkFall windows.
+
+        The registry copy is a discovery aid only; a peer deciding how to
+        answer a release request always re-reads the LIVE dirty state of
+        its own documents, so staleness here can never discard edits.
+        """
+        hub = getattr(self, "_instance_hub", None)
+        if hub is None:
+            return
+        docs: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for session in self._tab_sessions:
+            doc = session.doc
+            try:
+                key = doc.normalized_path
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append((key, bool(doc.is_dirty)))
+            except Exception:
+                continue
+        try:
+            hub.publish(docs)
+        except Exception:
+            pass
+
+    def _on_instance_release_request(self, request_id: str, path: str) -> None:
+        """Another window asks this one to release ``path`` for a save.
+
+        A clean document — read-only duplicates included — closes
+        silently through the ordinary teardown. A dirty editable
+        document gets the explicit Save / Discard / Cancel guard; a
+        cancelled prompt answers ``refused`` and preserves every edit.
+        The peer's own save that triggered this request must not
+        re-coordinate (it would ask us while we wait for it), so the
+        nested save path sets ``_instance_release_saving``.
+        """
+        hub = getattr(self, "_instance_hub", None)
+        if hub is None:
+            return
+        self._instance_release_saving = True
+        try:
+            status = "released" if self._release_documents_for_path(
+                path) else "refused"
+        except Exception:
+            status = "refused"
+        finally:
+            self._instance_release_saving = False
+        try:
+            hub.respond(request_id, status)
+        except Exception:
+            pass
+        self._publish_instance_docs()
+
+    def _release_documents_for_path(self, path: str) -> bool:
+        """Close every session of ``path`` in THIS window.
+
+        Only matching canonical paths are touched, never unrelated
+        documents. Closing runs through the guarded per-tab path, so a
+        cancelled unsaved-changes prompt refuses the whole release (the
+        requesting window keeps its file and saves elsewhere).
+        """
+        try:
+            key = normalize_key(path)
+        except Exception:
+            return False
+        released = True
+        for session in list(self._tab_sessions):
+            doc = session.doc
+            try:
+                if normalize_key(doc.normalized_path) != key:
+                    continue
+            except Exception:
+                continue
+            if not self._close_session(session):
+                released = False
+        return released
+
+    def _coordinate_save_start(self, target: str) -> None:
+        """Release same-file holders before a save needs exclusive access.
+
+        Closes THIS window's read-only duplicates of the target (their
+        render handles keep the file open on Windows) and asks every
+        other live InkFall window editing the same canonical file to
+        release it, with a bounded wait. Refusal or a timeout raises
+        :class:`SaveLockedError`, which the ordinary save-failure
+        recovery (toast + Save-As picker) handles. Coordination runs
+        before any temp file exists, so a failure leaves the save
+        transaction untouched. The atomic replace itself remains the
+        final arbiter against a window that opens the file afterwards.
+        """
+        if getattr(self, "_instance_release_saving", False):
+            # This save IS the peer's release in progress; re-coordinating
+            # would deadlock the two windows against each other.
+            return
+        self._close_readonly_duplicates_for_target(target)
+        hub = getattr(self, "_instance_hub", None)
+        if hub is None:
+            return
+        try:
+            key = normalize_key(target)
+        except Exception:
+            return
+        try:
+            peers = [
+                record for record in scan_instances(hub.directory)
+                if record.server != hub.server_name
+            ]
+        except Exception:
+            return
+        for record in peers:
+            if not any(doc_path == key for doc_path, _dirty in record.docs):
+                continue
+            try:
+                if self._save_dialog is not None:
+                    self._save_dialog.setLabelText(
+                        "Asking other Inkfall windows to release this"
+                        " file…")
+            except Exception:
+                pass
+            status = hub.request_release(
+                record.server, key,
+                timeout_s=self._INSTANCE_RELEASE_TIMEOUT_S)
+            if status != "released":
+                raise SaveLockedError(
+                    "Another Inkfall window is editing this file and did"
+                    " not release it. Close the document there, or save"
+                    " to a different file.")
+
+    def _close_readonly_duplicates_for_target(self, target: str) -> None:
+        """Close this window's read-only duplicates of ``target``.
+
+        A read-only duplicate holds its own backend handle and render
+        working copies for the same file, which would surface as a
+        destination-in-use error on Windows. It can never hold unsaved
+        edits (its store is frozen), so the guarded close is silent.
+        """
+        try:
+            key = normalize_key(target)
+        except Exception:
+            return
+        for session in list(self._tab_sessions):
+            doc = session.doc
+            try:
+                if not getattr(doc, "read_only", False):
+                    continue
+                if normalize_key(doc.normalized_path) != key:
+                    continue
+            except Exception:
+                continue
+            self._close_session(session)
 
     # -- custom chrome: maximize/restore, fullscreen, active state ----------
 
@@ -3026,6 +3203,7 @@ class MainWindow(QMainWindow):
             self._toast.show_message("Saved", name)
         except Exception:
             pass
+        self._publish_instance_docs()
         return True
 
     def _run_save_job(self, doc, target: str) -> None:
@@ -3088,6 +3266,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 dialog = None
                 self._save_dialog = None
+
+            # Cross-instance coordination: other InkFall windows editing
+            # the same file must release it before any save work starts
+            # (bounded wait; refusal/timeout raises SaveLockedError, which
+            # the ordinary recovery path handles).
+            self._coordinate_save_start(target)
 
             self._run_pool_blocking(
                 lambda: doc.prepare_for_save(target))
@@ -3721,6 +3905,14 @@ class MainWindow(QMainWindow):
                 # The modal progress loop prevents a close during a save;
                 # this drain is the belt-and-braces guarantee.
                 self._save_pool.waitForDone(30000)
+            except Exception:
+                pass
+            try:
+                # Other windows must stop seeing this instance in the
+                # coordination registry before the process goes away.
+                hub = getattr(self, "_instance_hub", None)
+                if hub is not None:
+                    hub.close()
             except Exception:
                 pass
             try:

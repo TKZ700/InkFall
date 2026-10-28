@@ -327,9 +327,22 @@ def nuitka_arguments(
             # Nuitka fans out C compilation across every core. Low-memory
             # mode selects memory-frugal C options and implies a single
             # C compiler job (the Nuitka 4.3.1 --jobs default under low
-            # memory is 1), which keeps peak cl.exe heap usage bounded.
-            # Linux GCC is unaffected; do not slow that build down.
+            # memory is 1), which bounds the fan-out but not the per-TU
+            # compiler heap. Linux GCC is unaffected; do not slow that
+            # build down.
             "--low-memory",
+            # pymupdf.mupdf is a ~69k-line SWIG-generated pure-Python
+            # wrapper that Nuitka compiles into a ~2.4M-line C file; cl
+            # exhausts its pass-2 optimizer heap on that single TU
+            # (C1002) no matter how few jobs run. The anti-bloat
+            # plugin's bytecode mode still INCLUDES the module — as
+            # frozen CPython 3.11 bytecode imported through Nuitka's
+            # meta-path loader — instead of translating it to C, so
+            # pymupdf stays fully functional, and the native
+            # _mupdf.pyd / mupdfcpp64.dll keep shipping as binary
+            # extensions. Scoping to the whole package also removes the
+            # ~900k-line C file pymupdf/__init__.py would produce.
+            "--noinclude-custom-mode=pymupdf:bytecode",
             "--windows-console-mode=disable",
             f"--windows-icon-from-ico={source_root / WINDOWS_ICON}",
             "--windows-create-installer",

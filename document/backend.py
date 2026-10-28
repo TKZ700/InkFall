@@ -12,6 +12,7 @@ No rasterization, no text extraction, no pixmaps, no full-page scan.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import tempfile
 import time
@@ -814,7 +815,8 @@ class PdfBackend:
     def export_pdf_in_process(self, target_path: str, native_pages: list,
                               manifest_bytes: bytes, expected_page_count: int,
                               expected_paper_keywords: str | None = None,
-                              *, progress=None, pump=None) -> None:
+                              *, progress=None, pump=None,
+                              snapshot_path: str | None = None) -> None:
         """Export through a spawned child process (the UI save path).
 
         Same contract and integrity checks as :meth:`export_pdf`, but the
@@ -829,6 +831,15 @@ class PdfBackend:
         ``pump`` is the UI's event-pumping wait: ``pump(poll)`` must call
         ``poll() -> (done, payload)`` until done and return the final
         payload. Without it the wait is a plain blocking loop.
+
+        ``snapshot_path`` optionally supplies an existing materialized
+        working copy to export from (the document layer's render work
+        copy, whose page state matches the live handle because every
+        handle mutation materializes immediately). When omitted or
+        unusable, this method writes its own disk snapshot exactly as
+        before. A borrowed file is never deleted here: on a same-path
+        save it becomes the pending snapshot backing the replacement
+        handle; otherwise it remains the caller's render file.
         """
         self._ensure_open()
         if not target_path or not isinstance(target_path, str):
@@ -844,27 +855,38 @@ class PdfBackend:
 
         self.ensure_export_supported()
 
-        fd, snapshot_path = tempfile.mkstemp(
-            prefix="inkfall-snapshot-", suffix=".pdf")
-        os.close(fd)
-        try:
-            os.remove(snapshot_path)
-        except OSError:
-            pass
-        _emit_progress(progress, "snapshot")
-        try:
-            self._doc.save(snapshot_path, encryption=_PDF_ENCRYPT_KEEP)
-        except Exception as e:
+        borrowed_snapshot: str | None = None
+        if isinstance(snapshot_path, str) and os.path.isfile(snapshot_path):
+            # The document layer offered its current materialized working
+            # copy as the export input. The newest work copy always
+            # mirrors the live handle's page state (every handle mutation
+            # materializes immediately; annotations never touch the
+            # handle), so reusing it skips a redundant full serialization
+            # of identical content — and the GIL-holding write with it.
+            borrowed_snapshot = snapshot_path
+            _emit_progress(progress, "snapshot")
+        else:
+            fd, snapshot_path = tempfile.mkstemp(
+                prefix="inkfall-snapshot-", suffix=".pdf")
+            os.close(fd)
             try:
-                if os.path.isfile(snapshot_path):
-                    os.remove(snapshot_path)
-            except Exception:
+                os.remove(snapshot_path)
+            except OSError:
                 pass
-            if self._encrypted_at_open:
-                raise EncryptedRewriteError(
-                    _ENCRYPTED_REWRITE_MESSAGE) from e
-            raise InvalidPdfError(
-                f"Cannot snapshot document for save: {e}") from e
+            _emit_progress(progress, "snapshot")
+            try:
+                self._doc.save(snapshot_path, encryption=_PDF_ENCRYPT_KEEP)
+            except Exception as e:
+                try:
+                    if os.path.isfile(snapshot_path):
+                        os.remove(snapshot_path)
+                except Exception:
+                    pass
+                if self._encrypted_at_open:
+                    raise EncryptedRewriteError(
+                        _ENCRYPTED_REWRITE_MESSAGE) from e
+                raise InvalidPdfError(
+                    f"Cannot snapshot document for save: {e}") from e
 
         target_abs = os.path.abspath(os.path.expanduser(target_path))
         target_dir = os.path.dirname(target_abs) or "."
@@ -919,6 +941,10 @@ class PdfBackend:
                 job, progress=progress, pump=pump)
             if not result or not result.get("ok"):
                 raise _export_error_from_result(result or {})
+            timings = result.get("timings")
+            if timings:
+                logging.getLogger(__name__).debug(
+                    "save child timings for %s: %s", target_abs, timings)
             temp_path = result.get("temp")
             if not isinstance(temp_path, str) or not os.path.isfile(temp_path):
                 raise InvalidPdfError(
@@ -952,7 +978,10 @@ class PdfBackend:
                     snapshot_pending = True
                 except Exception:
                     self._closed = True
-            if not snapshot_pending:
+            if not snapshot_pending and borrowed_snapshot is None:
+                # A borrowed file is the caller's render work copy (or is
+                # already the pending snapshot); deleting it would break
+                # the renderer or the live handle.
                 try:
                     if os.path.isfile(snapshot_path):
                         os.remove(snapshot_path)
@@ -1022,6 +1051,16 @@ class PdfBackend:
         return True
 
     # -- lifecycle -------------------------------------------------------
+
+    @property
+    def pending_snapshot(self) -> str | None:
+        """Snapshot file the live handle lazily reads after a save, if any.
+
+        Exposed so the document layer can protect it when pruning render
+        working copies: after a save that borrowed the work copy, this
+        file backs the replacement handle and must outlive it.
+        """
+        return self._snapshot_pending
 
     def close(self) -> None:
         """Release the handle. Idempotent and safe to repeat."""
@@ -1303,22 +1342,33 @@ def _export_child_main(job: dict, result_queue) -> None:
     """
     holder = None
     temp_path = None
+    timings: dict[str, float] = {}
     try:
+        from core.proc_lifetime import install_child_guard
+
+        # Non-Windows backstop so a crashed parent cannot orphan a save
+        # child blocked on its result queue (Windows: job object).
+        install_child_guard()
+        t0 = time.perf_counter()
         holder, protected = _open_export_snapshot(
             job["snapshot"], job.get("password"))
+        timings["open_s"] = round(time.perf_counter() - t0, 3)
         if job["encrypted_at_open"] and not protected:
             raise EncryptedRewriteError(
                 "The exported copy of this encrypted PDF would lose its "
                 "protection. The save was refused and the original file "
                 "is unchanged.")
         result_queue.put(("stage", "annotations"))
+        t0 = time.perf_counter()
         try:
             original_attachments = tuple(holder.embfile_names() or ())
         except Exception:
             original_attachments = ()
         markers = _apply_export_annotations(holder, job["native_pages"])
         _write_manifest_attachment(holder, job["manifest"])
+        timings["annotations_s"] = round(time.perf_counter() - t0, 3)
         result_queue.put(("stage", "write"))
+        t0 = time.perf_counter()
         try:
             temp_path = _write_export_temp(
                 holder, job["target_dir"], job["target"])
@@ -1329,9 +1379,11 @@ def _export_child_main(job: dict, result_queue) -> None:
                 raise EncryptedRewriteError(
                     _ENCRYPTED_REWRITE_MESSAGE) from exc
             raise
+        timings["write_s"] = round(time.perf_counter() - t0, 3)
         holder.close()
         holder = None
         result_queue.put(("stage", "verify"))
+        t0 = time.perf_counter()
         _verify_saved_pdf(
             temp_path, job["page_count"], job["manifest"],
             job["paper_keywords"], original_attachments,
@@ -1340,7 +1392,9 @@ def _export_child_main(job: dict, result_queue) -> None:
             expect_encrypted=protected,
             expected_permissions=(job.get("permissions")
                                   if protected else None))
-        result_queue.put(("done", {"ok": True, "temp": temp_path}))
+        timings["verify_s"] = round(time.perf_counter() - t0, 3)
+        result_queue.put(
+            ("done", {"ok": True, "temp": temp_path, "timings": timings}))
         temp_path = None
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         result_queue.put(("done", {

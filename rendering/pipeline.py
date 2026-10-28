@@ -1096,6 +1096,14 @@ class DocumentPipeline:
                 old_engine.cancel(req)
             except Exception:
                 pass
+        if old_proc is not None:
+            try:
+                # Queued-but-unassigned decodes would otherwise sit in the
+                # shutdown drain; dropping them here bounds the drain to
+                # decodes already owned by a worker.
+                old_proc.withdraw(set())
+            except Exception:
+                pass
         try:
             old_engine.shutdown()
         except Exception:

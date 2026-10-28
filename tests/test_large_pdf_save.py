@@ -16,6 +16,11 @@ These tests pin:
 - A failed final replacement preserves the original file, the live
   session, and every edit; no snapshot/temp files leak (including across
   consecutive same-path saves).
+- The process-backed save reuses the newest render work copy as its
+  export input (no second full serialization of identical content) and
+  pins the borrowed file's lifecycle: pending-snapshot protection against
+  work-copy pruning, Save-As fallback to a fresh snapshot, and failed
+  same-path recovery.
 - Ordinary save and read-only refusal behavior are unchanged.
 
 All PDFs are synthetic, generated under ``tmp_path``; nothing is committed
@@ -29,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -404,3 +410,212 @@ def page_count(pdf_path: str) -> int:
         return len(doc)
     finally:
         doc.close()
+
+
+# ---------------------------------------------------------------------------
+# process-path save reuses the render work copy (single serialization)
+# ---------------------------------------------------------------------------
+
+
+def _pumping_pump(stages: list | None = None, done_payload: dict | None = None):
+    """Headless stand-in for the UI's event pump: plain blocking loop.
+
+    Stage arrivals are coalesced by the poller exactly as in production
+    (the labels only feed the progress dialog), so ``stages`` may miss
+    fast intermediate stages; the final payload is always complete.
+    """
+
+    def pump(poll):
+        while True:
+            done, payload = poll()
+            if stages is not None and payload.get("stage"):
+                stages.append(payload["stage"])
+            if done:
+                if done_payload is not None:
+                    done_payload.update(payload)
+                return payload
+            time.sleep(0.01)
+
+    return pump
+
+
+def _work_copy_prefix(path: str) -> bool:
+    return os.path.basename(path).startswith("inkfall-work-")
+
+
+def test_same_path_save_borrows_the_render_work_copy(tmp_path: Path) -> None:
+    """A same-path save exports from the work copy, never a second write.
+
+    After prepare_for_save materializes the sanitized working copy, the
+    export input IS that file: the backend's pending snapshot (the file
+    backing the replacement handle) must be the borrowed work copy, no
+    fresh inkfall-snapshot temp may appear, and the document must stay
+    fully usable and export correctly.
+    """
+    pdf = make_pdf(str(tmp_path / "borrow.pdf"), pages=3)
+    baseline = _snapshots_in_temp()
+    doc = _open_doc(pdf)
+    _seed_stroke(doc, 0)
+    doc.mark_changed()
+    doc.prepare_for_save(pdf)  # materialize, as the UI save job does
+
+    stages: list[str] = []
+    done_payload: dict = {}
+    doc.write_export(pdf, pump=_pumping_pump(stages, done_payload))
+
+    backend = doc._backend
+    assert backend.pending_snapshot == doc.render_path, (
+        "the export must borrow the render work copy as the pending "
+        "snapshot instead of writing a second full serialization")
+    assert _work_copy_prefix(backend.pending_snapshot)
+    assert os.path.isfile(backend.pending_snapshot)
+    assert not (_snapshots_in_temp() - baseline), (
+        "a borrowed-work-copy save must not create snapshot temp files")
+    assert "verify" in stages
+    assert done_payload.get("ok") is True
+    assert "write_s" in (done_payload.get("timings") or {}), (
+        "the child must report per-stage timings for diagnostics")
+    reopened = pymupdf.open(pdf)
+    try:
+        assert len(reopened) == 3
+        assert reopened[0].first_annot is not None
+    finally:
+        reopened.close()
+    borrowed = backend.pending_snapshot
+    doc.close()
+    assert borrowed and not os.path.isfile(borrowed), (
+        "close() must retire the borrowed snapshot")
+
+
+def test_save_as_borrows_when_materialized_and_falls_back_otherwise(
+        tmp_path: Path) -> None:
+    """Save As borrows a current work copy; a fresh doc writes its own."""
+    pdf = make_pdf(str(tmp_path / "fresh.pdf"), pages=2)
+    original_bytes = Path(pdf).read_bytes()
+    baseline = _snapshots_in_temp()
+
+    # Freshly opened, nothing stripped: renderer still reads the source,
+    # so there is no work copy to borrow and the backend writes its own
+    # snapshot (then deletes it — a Save As never keeps one).
+    doc = _open_doc(pdf)
+    assert doc._export_snapshot_candidate() is None
+    copy_path = str(tmp_path / "as-copy.pdf")
+    doc.write_export(copy_path, pump=_pumping_pump())
+    assert doc._backend.pending_snapshot is None, (
+        "a non-same-path save must not pin a pending snapshot")
+    assert Path(copy_path).is_file()
+    assert Path(pdf).read_bytes() == original_bytes
+    doc.close()
+    assert not (_snapshots_in_temp() - baseline), (
+        "the fallback snapshot of a Save As must be deleted afterwards")
+
+    # A document whose renderer is on a work copy (page op materialized)
+    # borrows that copy even for Save As, and it stays a work copy.
+    pdf2 = make_pdf(str(tmp_path / "op.pdf"), pages=2)
+    doc2 = _open_doc(pdf2)
+    doc2.rotate_page(0, 90)
+    candidate = doc2._export_snapshot_candidate()
+    assert candidate is not None and _work_copy_prefix(candidate)
+    doc2.write_export(str(tmp_path / "as-copy2.pdf"), pump=_pumping_pump())
+    assert os.path.isfile(candidate), (
+        "a borrowed file must survive a Save As as the render work copy")
+    assert doc2._backend.pending_snapshot is None
+    doc2.close()
+
+
+def test_backend_export_falls_back_when_borrow_path_is_unusable(
+        tmp_path: Path) -> None:
+    """An unusable borrowed path falls back to the backend's own snapshot."""
+    pdf = make_pdf(str(tmp_path / "unit.pdf"), pages=2)
+    backend = PdfBackend.open(pdf)
+    try:
+        backend.export_pdf_in_process(
+            pdf, [], b'{"format":"probe"}', 2,
+            pump=_pumping_pump(), snapshot_path=str(tmp_path / "missing.pdf"))
+        assert Path(pdf).is_file()
+        assert backend.pending_snapshot is None or not _work_copy_prefix(
+            backend.pending_snapshot), (
+            "the fallback snapshot must not be mistaken for a borrowed "
+            "work copy")
+    finally:
+        backend.close()
+
+    # The borrow itself, at the backend contract level: the offered file
+    # becomes the pending snapshot on a same-path save.
+    backend2 = PdfBackend.open(pdf)
+    work = str(tmp_path / "inkfall-work-unit.pdf")
+    backend2.save_copy(work)
+    try:
+        backend2.export_pdf_in_process(
+            pdf, [], b'{"format":"probe"}', 2,
+            pump=_pumping_pump(), snapshot_path=work)
+        assert backend2.pending_snapshot == work
+        assert os.path.isfile(work)
+    finally:
+        backend2.close()
+    assert not os.path.isfile(work), (
+        "close() must retire the pending (borrowed) snapshot")
+
+
+def test_prune_keeps_the_pending_snapshot_alive(tmp_path: Path) -> None:
+    """A borrowed snapshot outlives work-copy pruning until it is retired."""
+    pdf = make_pdf(str(tmp_path / "prune.pdf"), pages=2)
+    doc = _open_doc(pdf)
+    doc.prepare_for_save(pdf)
+    doc.write_export(pdf, pump=_pumping_pump())
+    borrowed = doc._backend.pending_snapshot
+    assert borrowed is not None and _work_copy_prefix(borrowed)
+
+    # A page op materializes a new work copy; the pruning that follows
+    # must keep the file that backs the live handle.
+    doc.rotate_page(0, 90)
+    assert os.path.isfile(borrowed), (
+        "materialize pruning deleted the pending snapshot backing the "
+        "live handle")
+    assert doc.page_count == 2
+
+    # The next same-path save retires it: the handle closed before the
+    # replacement, so the old backing file may finally vanish.
+    doc.write_export(pdf, pump=_pumping_pump())
+    assert not os.path.isfile(borrowed)
+    assert doc._backend.pending_snapshot != borrowed
+    doc.close()
+
+
+def test_failed_same_path_save_with_borrow_keeps_session_usable(
+        tmp_path: Path, monkeypatch) -> None:
+    """A lock at replace after a borrowed export leaves everything intact."""
+    pdf = make_pdf(str(tmp_path / "locked2.pdf"), pages=2)
+    original_bytes = Path(pdf).read_bytes()
+    baseline = _snapshots_in_temp()
+
+    doc = _open_doc(pdf)
+    _seed_stroke(doc, 0)
+    doc.mark_changed()
+    doc.rotate_page(1, 180)  # materialize so the export borrows a work copy
+
+    import document.backend as backend_module
+
+    def _locked(_temp, _target):
+        raise SaveLockedError("simulated destination lock")
+
+    monkeypatch.setattr(backend_module, "_replace_target", _locked)
+    with pytest.raises(SaveLockedError):
+        doc.write_export(pdf, pump=_pumping_pump())
+    monkeypatch.undo()
+
+    assert Path(pdf).read_bytes() == original_bytes
+    assert doc.page_count == 2
+    assert doc.is_dirty
+    assert len([a for _p, a in doc.annotations.iter_all()]) == 1
+    borrowed = doc._backend.pending_snapshot
+    assert borrowed is not None and os.path.isfile(borrowed), (
+        "a failed same-path save must keep a usable live handle backed "
+        "by the borrowed file")
+    # Retry to a fresh destination succeeds through the same process path.
+    doc.write_export(str(tmp_path / "retry.pdf"), pump=_pumping_pump())
+    assert Path(str(tmp_path / "retry.pdf")).is_file()
+    doc.close()
+    assert not (_snapshots_in_temp() - baseline)
+    assert not glob.glob(str(tmp_path / ".inkfall-save-*")), (
+        "output temp files leaked in the target directory")

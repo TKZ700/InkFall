@@ -8,6 +8,7 @@ local development can run them without the optional build group.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import tomllib
 from pathlib import Path
@@ -147,6 +148,34 @@ def test_windows_low_memory_c_compilation_is_requested(tmp_path: Path) -> None:
     assert "--low-memory" in windows_args
     assert "--low-memory" not in linux_args
     assert not [arg for arg in linux_args if arg.startswith("--jobs")]
+
+
+def test_windows_pymupdf_ships_as_frozen_bytecode(tmp_path: Path) -> None:
+    """pymupdf must be included as bytecode, never compiled to a C TU.
+
+    The SWIG-generated ``pymupdf.mupdf`` module becomes a ~2.4M-line C
+    translation unit on which MSVC exhausts its pass-2 optimizer heap
+    (C1002) regardless of ``--low-memory``/``--jobs`` — the failure is
+    inside one TU. The anti-bloat "bytecode" mode still includes the
+    module (frozen CPython bytecode imported through Nuitka's meta-path
+    loader), so pymupdf stays fully functional; the native extensions
+    must keep resolving as binaries the build ships as-is.
+    """
+    windows_args = nuitka_arguments(
+        "windows", project_version(), source_root=SOURCE_ROOT,
+        build_root=tmp_path / "win", dist_dir=tmp_path / "win")
+    linux_args = nuitka_arguments(
+        "linux", project_version(), source_root=SOURCE_ROOT,
+        build_root=tmp_path / "linux", dist_dir=tmp_path / "linux")
+
+    flag = "--noinclude-custom-mode=pymupdf:bytecode"
+    assert flag in windows_args
+    assert not [arg for arg in linux_args if arg.startswith(
+        "--noinclude-custom-mode")]
+    # The flag names a real module layout: the pure-Python wrapper this
+    # targets and the native extensions that must ship alongside it.
+    assert importlib.util.find_spec("pymupdf.mupdf") is not None
+    assert importlib.util.find_spec("pymupdf._mupdf") is not None
 
 
 def test_qml_plugin_family_is_requested_explicitly(tmp_path: Path) -> None:

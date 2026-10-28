@@ -34,3 +34,13 @@ def _isolate_inkfall_settings():
             QSettings().remove(f"library/sections/{key}_collapsed")
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_instance_registry(tmp_path, monkeypatch):
+    """Cross-instance coordination files must never touch the real
+    per-user registry (and must not leak between tests or parallel
+    runs): every MainWindow creates an InstanceHub whose registry file
+    would otherwise advertise a phantom peer to other InkFall windows
+    on this machine."""
+    monkeypatch.setenv("INKFALL_INSTANCES_DIR", str(tmp_path / "instances"))

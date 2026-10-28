@@ -48,6 +48,16 @@ def main(argv: list[str] | None = None) -> int:
     fonts, icons and QML loading without opening a window. Normal
     launches ignore it and start the application.
     """
+    # Frozen-build multiprocessing bootstrap: standard for standalone
+    # executables, a no-op in development. Must precede everything else.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+    # Owner-side backstop: every helper process this app spawns (render
+    # decoders, save-export child) dies with it, even on a hard crash.
+    from core.proc_lifetime import assign_parent_job
+
+    assign_parent_job()
     _enable_fatal_diagnostics()
     args = list(sys.argv[1:] if argv is None else argv)
     if "--self-test" in args:

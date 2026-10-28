@@ -625,6 +625,26 @@ class Document:
         except Exception:
             return False
 
+    def _export_snapshot_candidate(self) -> str | None:
+        """Current materialized working copy, if it can back the export.
+
+        The newest work copy always mirrors the backend handle's page
+        state: every handle-mutating operation (page edits, restore-time
+        native stripping) materializes immediately, and annotations never
+        touch the handle — so the export can reuse it instead of writing
+        a second identical full serialization of the same content.
+        ``None`` (renderer still on the source, or the work copy is
+        unreadable) falls back to the backend's own snapshot write.
+        """
+        if self._render_path and not self._render_is_source():
+            candidate = self._render_path
+            try:
+                if os.path.isfile(candidate):
+                    return candidate
+            except Exception:
+                pass
+        return None
+
     def prepare_for_save(self, target_path: str) -> bool:
         """Detach the renderer from the source before a same-path save.
 
@@ -723,7 +743,8 @@ class Document:
         if pump is not None:
             self._backend.export_pdf_in_process(
                 target_path, native_pages, manifest_bytes, self.page_count,
-                paper_keywords, progress=progress, pump=pump)
+                paper_keywords, progress=progress, pump=pump,
+                snapshot_path=self._export_snapshot_candidate())
         else:
             self._backend.export_pdf(
                 target_path, native_pages, manifest_bytes, self.page_count,
@@ -992,13 +1013,23 @@ class Document:
         self._prune_work_files(keep=path)
 
     def _prune_work_files(self, keep: str | None = None) -> None:
+        try:
+            protected = self._backend.pending_snapshot
+        except Exception:
+            protected = None
         remaining = []
         for path in self._work_paths:
-            if path == keep:
+            if path == keep or (protected is not None and path == protected):
+                # ``keep`` backs the renderer; a pending snapshot backs
+                # the live handle after a save. Neither may vanish here.
                 remaining.append(path)
                 continue
             try:
                 os.remove(path)
+            except FileNotFoundError:
+                # Already retired elsewhere (e.g. the next same-path save
+                # deletes its borrowed predecessor): drop the stale entry.
+                continue
             except Exception:
                 remaining.append(path)
         self._work_paths = remaining
