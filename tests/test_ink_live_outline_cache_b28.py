@@ -44,6 +44,13 @@ def _oracle(pts, widths, cap="round"):
                          cap=cap)
 
 
+def _paint_oracle(pts, widths, cap="round"):
+    # The pen's live holder now serves the paint engine, so its
+    # full-rebuild oracle is that engine (not the legacy outline).
+    from annotations.ink_silhouette import silhouette
+    return silhouette(pts, widths, cap=cap)
+
+
 def _random_stroke(rng, n):
     pts, widths = [], []
     x, y = 0.0, 0.0
@@ -158,8 +165,8 @@ def test_invalidation_on_reset_refeed_and_restart():
     assert refed is not None and refed != first
     from annotations.ink_geometry import pressure_widths
     base6 = 6.0 * 72.0 / 25.4
-    assert refed == _oracle(
-        pts, list(pressure_widths((0.5,) * 30, base6, "normal")))
+    assert refed == _paint_oracle(
+            pts, list(pressure_widths((0.5,) * 30, base6, "normal")))
     # Cancel then restart: no stale state leaks into the new stroke.
     pen.cancel()
     assert pen.live_outline() is None
@@ -167,8 +174,8 @@ def test_invalidation_on_reset_refeed_and_restart():
     fresh = pen.live_outline()
     assert fresh is not None and fresh != first
     base6 = 6.0 * 72.0 / 25.4
-    # Single-sample strokes bypass smoothing (documented precondition).
-    assert fresh == _oracle(
+    # Single-sample strokes are a dot (documented precondition).
+    assert fresh == _paint_oracle(
         [(500.0, 500.0)],
         list(pressure_widths((0.5,), base6, "normal")))
     pen.up(page, 510.0, 510.0, 0.5, 10007)

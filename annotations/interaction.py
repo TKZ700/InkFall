@@ -18,9 +18,9 @@ from annotations.ink_geometry import (
     DEFAULT_PRESSURE_PROFILE,
     PRESSURE_PROFILES,
     LiveCenterline,
-    LiveOutline,
     pressure_width,
 )
+from annotations.ink_silhouette import LiveSilhouette
 from annotations.models import Highlighter, InkStroke, Shape, ShapeKind
 from core.types import PageId, Point, Rect, Size
 from tools.models import ToolInstance, ToolType
@@ -412,10 +412,12 @@ class PenHandler:
         # B.2.3: same latch mechanics for the response profile name.
         self._pending_profile = DEFAULT_PRESSURE_PROFILE
         self._stroke_profile = DEFAULT_PRESSURE_PROFILE
-        # B.2.3: append-only incremental outline for the live stroke.
-        # Fed mapped widths in parallel with _points; reset on
-        # down/cancel/up. Never affects stored raw samples.
-        self._live = LiveOutline()
+        # Append-only incremental silhouette for the live stroke. Fed
+        # mapped widths in parallel with _points; reset on
+        # down/cancel/up. Never affects stored raw samples, and it
+        # derives the same geometry the completed stroke will, so the
+        # commit is pixel-identical (no visible jump on release).
+        self._live = LiveSilhouette()
         # B.2.10: widthless incremental centerline for the live
         # stroke. Fed every accepted raw sample regardless of the
         # pressure latch (widthless — latch-independent); serves the

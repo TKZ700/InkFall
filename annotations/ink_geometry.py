@@ -9,13 +9,16 @@ Slice 2: ``build_outline`` converts centerline samples + full widths
 into a filled outline (``StrokeOutline``). Still pure and Qt-free;
 still no smoothing, resampling, velocity, or timestamp use.
 
-Mapping formula (B.2.1 audit recommendation, conservative defaults)::
+Mapping formula (the researched ``alpha`` / ``gamma`` pair)::
 
     width = base_width * (floor + (1 - floor) * clamp(p) ** exponent)
 
-with ``(floor, exponent)`` from ``PRESSURE_PROFILES[profile]``
-(B.2.3; retuned B.2.4 — ``"normal"`` is now the linear ``(0.2, 1.0)``
-candidate, no longer the original ``(0.3, 0.8)`` curve).
+with ``(floor, exponent)`` from ``PRESSURE_PROFILES[profile]`` and
+``floor = 1 - alpha``. The defaults are the researched curve (``normal``
+= ``(0.20, 1.5)``): gamma > 1 so light pressure reads as a fine line and
+firm pressure as the full nib, while the 20% floor keeps a light touch
+visible instead of pinching the ribbon to a sub-pixel hairline. See the
+profile table below.
 
 Properties, all covered by ``tests/test_ink_geometry_b21.py``:
 
@@ -77,19 +80,27 @@ MIN_WIDTH_RATIO = 0.3
 #: retune). Must stay positive to preserve monotonicity.
 RESPONSE_EXPONENT = 0.8
 
-#: Named pressure-response profiles (B.2.4): ``(minimum-width ratio,
-#: response exponent)`` per profile. ``normal`` is the B.2.4 linear
-#: candidate ``(0.20, 1.00)`` — width = 20% + 80% x pressure — chosen
-#: for a ~2.4x working-band response (was ~1.8x under the B.2.1 curve).
-#: ``soft`` answers light pressure sooner; ``hard`` shifts thickening
-#: toward firm pressure. Ordering soft >= normal >= hard holds for
-#: every pressure in [0, 1] — hence ``hard`` shares ``normal``'s 0.20
-#: floor with a steeper exponent instead of a higher floor; each curve
-#: is monotonic with values in [floor, 1.0] times the base width.
+#: Named pressure-response profiles: ``(minimum-width ratio, response
+#: exponent)``. Width = base * (floor + (1 - floor) * pressure **
+#: exponent), i.e. the researched ``alpha``/``gamma`` pair with
+#: ``alpha = 1 - floor`` and ``gamma`` = exponent.
+#:
+#: The B.2.4 linear ``(0.20, 1.00)`` curve moved the nib strictly
+#: proportionally to pressure, which reads flat in the 0.2-0.7 band
+#: where real strokes live and makes thin/tight parts look mechanical.
+#: The researched response is a power curve: ``gamma > 1`` holds the nib
+#: back under light contact (fine, tapered lines) and then blooms to the
+#: full width as you press — the pencil feel. ``soft`` answers light
+#: pressure far sooner; ``hard`` holds back until the stroke is
+#: deliberately pressed. The floor stays at 20% so a light touch is still
+#: a visible line: pressure must never pinch ``w`` toward zero (§6.4 of
+#: the handoff), which a 6% floor did. Ordering soft >= normal >= hard
+#: holds for every pressure in [0, 1]; each curve is monotonic with
+#: values in [floor, 1.0] times the base width.
 PRESSURE_PROFILES: dict[str, tuple[float, float]] = {
-    "soft": (0.3, 0.4),
-    "normal": (0.2, 1.0),
-    "hard": (0.2, 1.8),
+    "soft": (0.25, 0.42),
+    "normal": (0.20, 1.5),
+    "hard": (0.20, 2.2),
 }
 
 #: Fallback profile for unknown persisted/forwarded values.

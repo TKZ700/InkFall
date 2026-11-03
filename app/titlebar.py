@@ -14,7 +14,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
-from app.icons import app_icon, icon
+from app.icons import app_icon, app_icon_pixmap, hd_pixmap, icon
 from app.theme.tokens import InkfallTokens, token_rgba
 from app.theme.typography import role_font
 
@@ -165,9 +165,9 @@ class TitleBar(QWidget):
         return btn
 
     def _sync_icon(self) -> None:
-        pm = app_icon().pixmap(20, 20)
+        pm = app_icon_pixmap(20)
         if pm.isNull():
-            pm = icon("library", "#8B93E0", 20).pixmap(20, 20)
+            pm = hd_pixmap(icon("library", "#8B93E0", 20), 20)
         self._icon.setPixmap(pm)
 
     # -- state ---------------------------------------------------------------

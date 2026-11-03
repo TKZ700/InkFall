@@ -8,10 +8,11 @@ unicode UI glyphs (no emoji, no font-dependent symbols).
 from __future__ import annotations
 
 from PySide6.QtCore import QByteArray, QSize, Qt
-from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QIconEngine, QPainter, QPixmap
 
 __all__ = ["icon", "icon_names", "pixmap", "tool_pixmap", "tool_icon",
-           "ensure_contrast_fg", "contrast_ratio", "ink_center_offset"]
+           "ensure_contrast_fg", "contrast_ratio", "ink_center_offset",
+           "logical_size", "app_icon_pixmap", "hd_pixmap"]
 
 _STROKE = "fill='none' stroke='{c}' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'"
 
@@ -276,6 +277,48 @@ def icon_names() -> tuple[str, ...]:
     return tuple(sorted(_PATHS))
 
 
+def _icon_dpr() -> float:
+    """Device pixel ratio icon rasters are drawn for.
+
+    Icons used to be rendered at *logical* size and then upscaled by the
+    display scale, which is exactly why every toolbar/tabbar/library glyph
+    looked soft on a 125%+ display. Rendering at the physical resolution and
+    tagging the pixmap with the ratio keeps each call site's logical size
+    while landing on real device pixels.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            ratio = float(screen.devicePixelRatio() or 1.0)
+            if 0.0 < ratio < 8.0:
+                return max(1.0, ratio)
+    except Exception:
+        pass
+    return 1.0
+
+
+def logical_size(pix) -> tuple[float, float]:
+    """Logical (device-independent) width/height of an icon pixmap.
+
+    Icon pixmaps are rendered at the display's physical resolution and
+    tagged with its device pixel ratio, so ``width()`` is *device* pixels.
+    Centering math must use these logical units so the drawn size and
+    position are identical at every scale. Never raises.
+    """
+    try:
+        ratio = float(pix.devicePixelRatio() or 1.0)
+    except Exception:
+        ratio = 1.0
+    if not 0.0 < ratio < 8.0:
+        ratio = 1.0
+    try:
+        return (float(pix.width()) / ratio, float(pix.height()) / ratio)
+    except Exception:
+        return (0.0, 0.0)
+
+
 def _svg(name: str, color: str, keyline: str | None = None) -> bytes:
     body = _PATHS[name].format(c=color)
     if keyline:
@@ -414,13 +457,23 @@ def ink_center_offset(pix, cache_key=None) -> tuple[float, float]:
                         y1 = y
         if x1 < x0 or y1 < y0:
             return (0.0, 0.0)
-        dx = (w / 2.0) - ((x0 + x1 + 1) / 2.0)
-        dy = (h / 2.0) - ((y0 + y1 + 1) / 2.0)
+        # The pixmap is rasterized at the display's physical resolution, so
+        # the measured ink bounds are device pixels: normalize back to the
+        # logical units every caller draws in (offsets are DPR-invariant).
+        try:
+            ratio = float(pix.devicePixelRatio() or 1.0)
+        except Exception:
+            ratio = 1.0
+        if not 0.0 < ratio < 8.0:
+            ratio = 1.0
+        dx = ((w / 2.0) - ((x0 + x1 + 1) / 2.0)) / ratio
+        dy = ((h / 2.0) - ((y0 + y1 + 1) / 2.0)) / ratio
         # Clamp pathological shifts (mostly-empty pixmaps) to a sane range.
         dx = max(-8.0, min(8.0, dx))
         dy = max(-8.0, min(8.0, dy))
         result = (dx, dy)
         if cache_key is not None:
+            cache_key = (cache_key, ratio)
             try:
                 if len(_INK_OFFSET_CACHE) < 4096:
                     _INK_OFFSET_CACHE[cache_key] = result
@@ -433,17 +486,149 @@ def ink_center_offset(pix, cache_key=None) -> tuple[float, float]:
 
 def _render(name: str, color: str, size: int,
             keyline: str | None = None):
+    """Rasterize one glyph at the display's physical resolution.
+
+    The pixmap is ``size`` *logical* px: it carries ``size * dpr`` real
+    pixels and a device pixel ratio, so painters draw it at ``size`` but
+    sample every device pixel (no upscale blur).
+    """
     from PySide6.QtSvg import QSvgRenderer
 
+    dpr = _icon_dpr()
+    px = max(1, int(round(float(size) * dpr)))
     renderer = QSvgRenderer(QByteArray(_svg(name, color, keyline)))
-    image = QPixmap(size, size)
+    image = QPixmap(px, px)
     image.fill(Qt.GlobalColor.transparent)
     painter = QPainter(image)
     try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         renderer.render(painter)
     finally:
         painter.end()
+    image.setDevicePixelRatio(dpr)
     return image
+
+
+_ICON_ENGINES: dict[tuple, "_SvgIconEngine"] = {}
+
+
+class _SvgIconEngine(QIconEngine):
+    """Vector icon engine: rasterizes the SVG at the requested pixel size.
+
+    ``QIcon(pixmap)`` can only resample the single bitmap it was built
+    from, so a 20 px glyph requested at 30 device pixels (a 150% display)
+    came out soft — the app-wide "icons look blurry" report. This engine
+    renders the vector per request, so every icon size and every device
+    ratio is drawn at full resolution.
+    """
+
+    def __init__(self, name: str, color: str,
+                 keyline: str | None = None) -> None:
+        super().__init__()
+        self._name = str(name)
+        self._color = str(color)
+        self._keyline = keyline
+        self._data = _svg(self._name, self._color, self._keyline)
+
+    def paint(self, painter, rect, mode, state) -> None:  # noqa: N802
+        """Render the vector straight into ``rect`` (device-correct)."""
+        try:
+            from PySide6.QtCore import QRectF
+            from PySide6.QtSvg import QSvgRenderer
+
+            renderer = QSvgRenderer(QByteArray(self._data))
+            painter.save()
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                renderer.render(painter, QRectF(rect))
+            finally:
+                painter.restore()
+        except Exception:
+            pass
+
+    def pixmap(self, size, mode, state):  # noqa: N802
+        """Rasterize at exactly the requested pixel size."""
+        try:
+            width = max(1, int(size.width()))
+            height = max(1, int(size.height()))
+        except Exception:
+            width = height = 20
+        image = QPixmap(width, height)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        try:
+            if painter.isActive():
+                self.paint(painter, image.rect(), mode, state)
+        finally:
+            try:
+                painter.end()
+            except Exception:
+                pass
+        return image
+
+    def scaledPixmap(self, size, mode, state, scale):  # noqa: N802
+        """Render at ``size * scale`` physical pixels and tag the ratio.
+
+        Qt asks engines for a pixmap at the widget's device ratio; the
+        default implementation can hand back a logical-size bitmap that the
+        painter then upscales. Drawing the vector at the physical size and
+        setting the ratio keeps the layout size while landing on real
+        pixels.
+        """
+        try:
+            dpr = float(scale)
+        except Exception:
+            dpr = 1.0
+        if not 0.0 < dpr < 8.0:
+            dpr = 1.0
+        try:
+            width = max(1, int(round(float(size.width()) * dpr)))
+            height = max(1, int(round(float(size.height()) * dpr)))
+        except Exception:
+            width = height = 20
+            dpr = 1.0
+        image = self.pixmap(QSize(width, height), mode, state)
+        if not image.isNull():
+            image.setDevicePixelRatio(dpr)
+        return image
+
+    def clone(self):  # noqa: N802
+        return _SvgIconEngine(self._name, self._color, self._keyline)
+
+
+def _engine_icon(name: str, color: str,
+                 keyline: str | None = None) -> QIcon:
+    """A QIcon backed by the vector engine (cached engine, cloned per use)."""
+    key = (str(name), str(color), keyline)
+    engine = _ICON_ENGINES.get(key)
+    if engine is None:
+        if len(_ICON_ENGINES) >= 512:
+            _ICON_ENGINES.clear()
+        engine = _SvgIconEngine(name, color, keyline)
+        _ICON_ENGINES[key] = engine
+    # QIcon takes ownership of the engine it is handed. Mark the clone as
+    # C++-owned so Python never deletes it a second time when the wrapper is
+    # collected (a double free would crash the app, not just blur an icon).
+    clone = engine.clone()
+    try:
+        from shiboken6 import Shiboken
+
+        Shiboken.setCppOwnership(clone)
+    except Exception:
+        pass
+    return QIcon(clone)
+
+
+def _tool_style(color: str, background: str) -> tuple[str, str | None]:
+    """``(fill, keyline)`` making a tool glyph legible on a surface."""
+    try:
+        original_ok = (contrast_ratio(str(color), str(background))
+                       >= MIN_ICON_CONTRAST)
+    except Exception:
+        original_ok = True
+    fill = ensure_contrast_fg(str(color), str(background))
+    keyline = None if original_ok else _keyline_for(str(background))
+    return fill, keyline
 
 
 def tool_pixmap(name: str, color: str = "#1b1e26",
@@ -458,12 +643,7 @@ def tool_pixmap(name: str, color: str = "#1b1e26",
     near-invisible, never blank, on either theme.
     """
     try:
-        original_ok = contrast_ratio(str(color), str(background)) >= MIN_ICON_CONTRAST
-    except Exception:
-        original_ok = True
-    fill = ensure_contrast_fg(str(color), str(background))
-    keyline = None if original_ok else _keyline_for(str(background))
-    try:
+        fill, keyline = _tool_style(color, background)
         return _render(name, fill, size, keyline)
     except Exception:
         return QPixmap()
@@ -471,8 +651,12 @@ def tool_pixmap(name: str, color: str = "#1b1e26",
 
 def tool_icon(name: str, color: str = "#1b1e26",
               background: str = "#181C23", size: int = 20) -> QIcon:
-    """QIcon variant of :func:`tool_pixmap`."""
-    return QIcon(tool_pixmap(name, color, background, size))
+    """QIcon variant of :func:`tool_pixmap` (vector at any size/ratio)."""
+    try:
+        fill, keyline = _tool_style(color, background)
+        return _engine_icon(name, fill, keyline)
+    except Exception:
+        return QIcon(tool_pixmap(name, color, background, size))
 
 
 def pixmap(name: str, color: str = "#a7aebb", size: int = 20) -> QPixmap:
@@ -484,8 +668,46 @@ def pixmap(name: str, color: str = "#a7aebb", size: int = 20) -> QPixmap:
 
 
 def icon(name: str, color: str = "#a7aebb", size: int = 20) -> QIcon:
-    """Build a QIcon for buttons and actions."""
-    return QIcon(pixmap(name, color, size))
+    """Build a resolution-independent QIcon for buttons and actions."""
+    try:
+        return _engine_icon(name, color)
+    except Exception:
+        return QIcon(pixmap(name, color, size))
+
+
+def app_icon_pixmap(size: int) -> QPixmap:
+    """Brand mark at ``size`` logical px, rasterized for the display ratio."""
+    dpr = _icon_dpr()
+    px = max(1, int(round(float(size) * dpr)))
+    try:
+        pix = app_icon().pixmap(QSize(px, px))
+        if not pix.isNull():
+            pix.setDevicePixelRatio(dpr)
+        return pix
+    except Exception:
+        return QPixmap()
+
+
+def hd_pixmap(icon_obj: QIcon, width: int,
+              height: int | None = None) -> QPixmap:
+    """``width`` x ``height`` *logical* px, rasterized for the display ratio.
+
+    ``QIcon.pixmap(w, h)`` returns w x h device pixels with no ratio, so a
+    label or pixmap button upscaled it on a 125%+ display (blurry). This
+    returns the pixel size the screen actually needs and tags it, so the
+    widget still lays it out at ``width`` x ``height`` logical px.
+    """
+    dpr = _icon_dpr()
+    try:
+        w = max(1, int(width))
+        h = max(1, int(height if height is not None else width))
+        pix = icon_obj.pixmap(QSize(max(1, int(round(w * dpr))),
+                                    max(1, int(round(h * dpr)))))
+        if not pix.isNull():
+            pix.setDevicePixelRatio(dpr)
+        return pix
+    except Exception:
+        return QPixmap()
 
 
 def _brand_dir() -> object:

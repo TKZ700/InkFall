@@ -168,17 +168,19 @@ def test_helper_min_max_widths_in_points():
         pressures=(0.0, 1.0), width_mm=25.4 / 72.0 * 4.0))
     assert outline is not None and outline.dots == ()
     base_pt = 4.0
-    xs = [p.x for p in outline.polygon]
     ys = [p.y for p in outline.polygon]
-    assert min(ys) == pytest.approx(-base_pt / 2.0)  # max pressure rail
-    assert max(ys) == pytest.approx(base_pt / 2.0)
-    # Minimum-pressure end rails sit at the normal-profile floor
-    # (B.2.4 retune: 0.2 * base half-width; was 0.3 before the retune).
-    low_x = xs[0]
-    lows = sorted(p.y for p in outline.polygon
-                  if abs(p.x - low_x) < 1e-9)
-    assert lows[0] == pytest.approx(-base_pt * 0.2 / 2.0)
-    assert lows[-1] == pytest.approx(base_pt * 0.2 / 2.0)
+    # Full pressure uses the whole nib: the silhouette's height is the
+    # base width (rails sit at +/- base/2; a tapered span tilts its
+    # tangent, so the extreme vertex is a hair inside it).
+    assert max(ys) - min(ys) == pytest.approx(base_pt, abs=0.01)
+    assert max(abs(y) for y in ys) <= base_pt / 2.0 + 1e-9
+    # Light pressure is a fine line: at the low-pressure end the ink
+    # stays at the profile floor (20% of base, never a sub-pixel zero).
+    floor_half = base_pt * 0.20 / 2.0
+    near_start = [p.y for p in outline.polygon if p.x < 0.05]
+    assert near_start
+    assert max(abs(y) for y in near_start) == pytest.approx(floor_half,
+                                                            abs=0.01)
     viewer.close()
 
 
@@ -690,8 +692,12 @@ def test_real_config_path_yields_variable_outline():
         assert done.pressure_enabled is True
         outline = viewer._pressure_outline(done)
         assert outline is not None and outline.dots == ()
-        ys = sorted(p.y for p in outline.polygon if abs(p.x) < 1e-9)
-        wide = sorted(p.y for p in outline.polygon if abs(p.x - 20.0) < 1e-9)
-        assert ys[-1] - ys[0] < wide[-1] - wide[0]
+        # Measure the ink's height in a small window around each sample:
+        # a tapered span tilts its rails, so the vertices are not
+        # required to sit exactly on the sample's x.
+        def _height(cx):
+            ys = [p.y for p in outline.polygon if abs(p.x - cx) < 1.0]
+            return max(ys) - min(ys)
+        assert _height(0.0) < _height(20.0)
     finally:
         viewer.close()

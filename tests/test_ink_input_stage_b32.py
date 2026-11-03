@@ -20,11 +20,11 @@ import time
 
 from annotations.ink_geometry import (
     LiveCenterline,
-    LiveOutline,
     build_outline,
     pressure_width,
     smooth_centerline,
 )
+from annotations.ink_silhouette import LiveSilhouette
 from annotations.interaction import (
     CollapseStage,
     InputStage,
@@ -296,7 +296,9 @@ def test_stage_to_builder_parity_zero_mismatches():
             der = derived_of(run)
             if not der:
                 continue
-            lo, lc = LiveOutline(), LiveCenterline()
+            # The pen's live holder now serves the paint engine, so the
+            # parity oracle is the silhouette builder, not the legacy one.
+            lo, lc = LiveSilhouette(), LiveCenterline()
             for (x, y), p in zip(der, derived_pressures(run)):
                 lo.append(x, y, pressure_width(p, BASE_PT, "normal"))
                 lc.append(x, y)

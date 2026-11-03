@@ -42,7 +42,7 @@ _EDGE_TANGENTS = {
     "w": ("nw", "sw"),
 }
 
-#: Built cursors, keyed by (size, color).
+#: Built cursors, keyed by (size, color, device ratio).
 _ROTATE_CACHE: dict = {}
 
 
@@ -50,17 +50,24 @@ def rotate_cursor(size: int = 22, color: str = "#8B93E0") -> QCursor:
     """A cached custom rotate cursor: an open arc with an arrowhead.
 
     Drawn at ``size`` px with the hotspot at the centre so the pointer
-    stays on the rotation pivot, and cached per (size, color).
+    stays on the rotation pivot, and cached per (size, color, ratio).
     """
-    key = (int(size), str(color))
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        dpr = float(screen.devicePixelRatio() or 1.0) if screen is not None else 1.0
+    except Exception:
+        dpr = 1.0
+    if not 0.0 < dpr < 4.0:
+        dpr = 1.0
+    key = (int(size), str(color), dpr)
     cached = _ROTATE_CACHE.get(key)
     if cached is not None:
         return cached
     size = max(12, int(size))
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    try:
+
+    def draw(painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         tone = QColor(str(color))
         if not tone.isValid():
@@ -92,9 +99,11 @@ def rotate_cursor(size: int = 22, color: str = "#8B93E0") -> QCursor:
             QPointF(ex + tip_dy * head * 0.72,
                     ey - tip_dx * head * 0.72),
         ])
-    finally:
-        painter.end()
-    cursor = QCursor(pixmap, size // 2, size // 2)
+
+    # The shared helper rasterizes at the display's physical pixels and
+    # tags the ratio, so the rotate glyph is never upscaled by the
+    # compositor (the other tool cursors already went through it).
+    cursor = _render_cursor(size, size, dpr, size // 2, size // 2, draw)
     _ROTATE_CACHE[key] = cursor
     return cursor
 

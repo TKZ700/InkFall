@@ -48,7 +48,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QAbstractButton, QWidget, QWidgetAction
 
-from app.icons import app_icon, icon, pixmap
+from app.icons import app_icon, hd_pixmap, icon, logical_size, pixmap
 from app.theme.tokens import InkfallTokens, token_rgba
 from app.theme.typography import role_font
 
@@ -390,11 +390,12 @@ class _IconButton(QAbstractButton):
     def _draw_icon(self, painter: QPainter, color: str) -> None:
         if self._brand and self._brand_icon is not None:
             # The brand mark is used exactly as supplied (never recolored).
-            pm = self._brand_icon.pixmap(self._icon_size, self._icon_size)
+            pm = hd_pixmap(self._brand_icon, self._icon_size)
             if not pm.isNull():
+                pm_w, pm_h = logical_size(pm)
                 painter.drawPixmap(
-                    int(round((self.width() - pm.width()) / 2.0)),
-                    int(round((self.height() - pm.height()) / 2.0)), pm)
+                    int(round((self.width() - pm_w) / 2.0)),
+                    int(round((self.height() - pm_h) / 2.0)), pm)
                 return
         pix = pixmap(self._icon_name, color, self._icon_size)
         if not pix.isNull():

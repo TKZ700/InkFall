@@ -1,10 +1,10 @@
 """B.2.3 Stage 2: Soft/Normal/Hard pressure-response profiles.
 
 Curve tables, latch isolation, Settings persistence + UI, and
-rendering-path integration. B.2.4 retuned all three curves (normal is
-now the linear (0.2, 1.0) candidate — see
-test_normal_matches_retuned_linear_formula); the per-tool Pressure
-toggle stays independent.
+rendering-path integration. All three curves are the researched power
+response (normal is (0.20, 1.5) — see
+test_normal_matches_power_formula); the per-tool Pressure toggle stays
+independent.
 """
 
 from __future__ import annotations
@@ -27,9 +27,9 @@ pytestmark = pytest.mark.usefixtures("qapp")
 PRESSURES = [0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0]
 
 EXPECTED = {
-    "soft": [0.300, 0.511, 0.579, 0.668, 0.760, 0.830, 0.924, 1.000],
-    "normal": [0.200, 0.240, 0.280, 0.360, 0.480, 0.600, 0.800, 1.000],
-    "hard": [0.200, 0.204, 0.213, 0.244, 0.321, 0.430, 0.677, 1.000],
+    "soft": [0.250, 0.463, 0.535, 0.631, 0.733, 0.811, 0.915, 1.000],
+    "normal": [0.200, 0.209, 0.225, 0.272, 0.366, 0.483, 0.720, 1.000],
+    "hard": [0.200, 0.201, 0.205, 0.223, 0.279, 0.374, 0.625, 1.000],
 }
 
 
@@ -51,18 +51,18 @@ def test_exact_width_ratios_per_profile():
         assert got == pytest.approx(expected, abs=1e-3), profile
 
 
-def test_normal_matches_retuned_linear_formula():
-    # B.2.4 DELIBERATE CHANGE: "normal" is no longer the B.2.1 (0.3,
-    # 0.8) curve. The old curve's working band spanned only ~1.8x in
-    # width and was judged too subtle on hardware; the B.2.4 candidate
-    # is linear (0.2, 1.0): width = 20% + 80% x pressure, ~2.4x across
-    # the 0.1-0.6 band. This test pins the NEW formula exactly.
-    import math
-
+def test_normal_matches_power_formula():
+    # DELIBERATE CHANGE: the linear (0.20, 1.00) curve moved the nib
+    # strictly in proportion to pressure, which reads flat across the
+    # 0.2-0.7 band where real strokes live. "normal" is now the
+    # researched power response (0.20, 1.5): width = 20% + 80% x
+    # pressure ** 1.5 — light contact stays a 20% fine line (never a
+    # sub-pixel hairline) and firm contact reaches the full nib. This
+    # test pins the formula exactly.
     for p in [i / 100.0 for i in range(101)]:
-        linear = 0.2 + 0.8 * max(0.0, min(1.0, p))
+        curve = 0.20 + 0.80 * max(0.0, min(1.0, p)) ** 1.5
         assert pressure_width(p, 2.5, "normal") == pytest.approx(
-            2.5 * linear)
+            2.5 * curve)
         # Default profile argument reproduces the old call shape.
         assert pressure_width(p, 2.5) == pressure_width(p, 2.5, "normal")
 
@@ -90,6 +90,10 @@ def test_each_profile_monotonic():
 def test_soft_answers_light_pressure_hard_holds_back():
     assert pressure_width(0.05, 1.0, "soft") > 0.45
     assert pressure_width(0.1, 1.0, "soft") > 0.5
+    # The power response: light contact stays a fine line but never
+    # disappears, and firm contact blooms to the full nib.
+    assert pressure_width(0.05, 1.0, "normal") < 0.25
+    assert pressure_width(0.75, 1.0, "normal") > 0.65
     assert pressure_width(0.1, 1.0, "hard") < 0.3
     assert pressure_width(0.5, 1.0, "hard") < 0.6
     for profile in PRESSURE_PROFILES:

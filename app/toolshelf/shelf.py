@@ -65,7 +65,8 @@ from PySide6.QtWidgets import (
 )
 
 from app import fx as _fx
-from app.icons import app_icon
+from app.icons import app_icon, app_icon_pixmap
+from app.icons import logical_size as _icon_size
 from app.icons import ink_center_offset as _ink_offset
 from app.icons import pixmap as _icon_pixmap
 from app.theme.tokens import InkfallTokens
@@ -408,11 +409,12 @@ class _HandleCell(QAbstractButton):
             # App mark only — zero dot/grip decoration by design.
             # Affordance is hold/drag interaction + circular hover/press,
             # never painted dots. Icon centered in the 30px circle.
-            mark = app_icon().pixmap(20, 20)
+            mark = app_icon_pixmap(20)
             if not mark.isNull():
+                mark_w, mark_h = _icon_size(mark)
                 painter.drawPixmap(
-                    int(round(cx - mark.width() / 2.0)),
-                    int(round(cy - mark.height() / 2.0)),
+                    int(round(cx - mark_w / 2.0)),
+                    int(round(cy - mark_h / 2.0)),
                     mark,
                 )
         except Exception:
@@ -475,8 +477,9 @@ class _AddCell(QAbstractButton):
                     _dx, _dy = _ink_offset(self._glyph)
                 except Exception:
                     _dx, _dy = (0.0, 0.0)
-                x = cx - self._glyph.width() / 2 + _dx
-                y = cy - self._glyph.height() / 2 + _dy
+                glyph_w, glyph_h = _icon_size(self._glyph)
+                x = cx - glyph_w / 2 + _dx
+                y = cy - glyph_h / 2 + _dy
                 painter.drawPixmap(int(round(x)), int(round(y)), self._glyph)
         except Exception:
             pass

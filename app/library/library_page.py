@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.icons import app_icon, icon
+from app.icons import app_icon, app_icon_pixmap, hd_pixmap, icon
 from app.library.delegate import LibraryDelegate
 from app.library.dialogs import LibraryConfirmModal, LibraryPromptModal
 from app.library.qt_model import (
@@ -370,7 +370,7 @@ class _EmptyState(QWidget):
         """Configure the empty-state copy (second action optional)."""
         tokens = getattr(self, "_tokens", None)
         if tokens is not None:
-            art_pm = icon(art, tokens.text_muted, 56).pixmap(56, 56)
+            art_pm = hd_pixmap(icon(art, tokens.text_muted, 56), 56)
             self._art.setPixmap(art_pm)
         self._title.setText(title)
         self._hint.setText(hint)
@@ -530,12 +530,12 @@ class LibraryPage(QWidget):
         header = QHBoxLayout()
         header.setSpacing(12)
         self._brand_icon = QLabel()
-        brand_pm = app_icon().pixmap(24, 24)
+        brand_pm = app_icon_pixmap(24)
         if not brand_pm.isNull():
             self._brand_icon.setPixmap(brand_pm)
         else:
             self._brand_icon.setPixmap(
-                icon("library", tokens.text_secondary, 24).pixmap(24, 24))
+                hd_pixmap(icon("library", tokens.text_secondary, 24), 24))
         header.addWidget(self._brand_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
         brand_col = QVBoxLayout()
         brand_col.setSpacing(2)
@@ -1030,7 +1030,8 @@ class LibraryPage(QWidget):
         layout.addWidget(home)
         for fid, name in trail:
             chev = QLabel()
-            chev.setPixmap(icon("chevron-right", t.text_muted, 12).pixmap(12, 12))
+            chev.setPixmap(hd_pixmap(
+                icon("chevron-right", t.text_muted, 12), 12))
             layout.addWidget(chev)
             if fid == self._current_folder_id:
                 current = QLabel(name)

@@ -12,7 +12,7 @@ from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from app.icons import icon
+from app.icons import hd_pixmap, icon
 from app.modal import CenteredModal
 from app.theme.manager import ThemeManager
 from app.theme.tokens import InkfallTokens
@@ -48,7 +48,7 @@ class ActionRow(QWidget):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(14)
         art = QLabel()
-        art.setPixmap(icon("plus", "#8B93E0", 22).pixmap(26, 26))
+        art.setPixmap(hd_pixmap(icon("plus", "#8B93E0", 22), 26))
         layout.addWidget(art)
         texts = QVBoxLayout()
         texts.setContentsMargins(0, 0, 0, 0)
@@ -227,8 +227,9 @@ class NewModal(CenteredModal):
                 f" outline: 0; }}"
             )
             try:
-                dim_pm = icon(row._inkfall_icon, t.text_secondary, 22).pixmap(26, 26)
-                lit_pm = icon(row._inkfall_icon, t.accent, 22).pixmap(26, 26)
+                dim_pm = hd_pixmap(
+                    icon(row._inkfall_icon, t.text_secondary, 22), 26)
+                lit_pm = hd_pixmap(icon(row._inkfall_icon, t.accent, 22), 26)
                 row.set_hover_art(t, dim_pm, lit_pm)
                 row._inkfall_art.setPixmap(
                     lit_pm if row._hover_lit else dim_pm)

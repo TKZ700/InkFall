@@ -19,16 +19,17 @@ from annotations.ink_geometry import (
 
 BASE = 0.7  # pen default width_mm (tests use it as an arbitrary base)
 
-# B.2.4 deliberately changed the default ("normal") curve from the
-# B.2.1 (0.3, 0.8) mapping to the linear (0.2, 1.0) candidate: the old
-# curve's working band (0.1-0.6 pressure) spanned only ~1.8x in width,
-# which hardware-feel review judged too subtle. The new curve spans
-# ~2.4x across the same band while keeping a nonzero floor so light
-# touches stay visible. Tests below pin the NEW normal curve; the
-# retained MIN_WIDTH_RATIO/RESPONSE_EXPONENT constants document the
-# superseded B.2.1 defaults only.
+# DELIBERATE CHANGE: the default ("normal") curve moved from the
+# linear (0.20, 1.00) candidate to the researched power response
+# (0.20, 1.5). A linear map reads flat across the 0.2-0.7 band where
+# real strokes live; a gamma > 1 curve holds the nib back under light
+# contact and blooms to the full width when pressed ─ the pencil feel.
+# The 20% floor is retained so light touches stay visible instead of
+# collapsing to a sub-pixel hairline. Tests below pin the NEW normal
+# curve; the retained MIN_WIDTH_RATIO/RESPONSE_EXPONENT constants
+# document the superseded B.2.1 defaults only.
 NORMAL_FLOOR = 0.2
-NORMAL_EXPONENT = 1.0
+NORMAL_EXPONENT = 1.5
 
 
 def test_constants_are_conservative_defaults():

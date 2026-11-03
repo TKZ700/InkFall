@@ -40,6 +40,7 @@ from annotations.ink_geometry import (
     pressure_widths,
     smooth_centerline,
 )
+from annotations.ink_silhouette import stroke_silhouette
 from annotations.models import InkStroke, Highlighter, Shape
 
 __all__ = ["capture_page_annotations", "render_annotation_overlay"]
@@ -164,9 +165,10 @@ def _paint_ink(painter: QPainter, item, factor: float) -> None:
     base_pt = max(0.1, _pt(width_mm, 0.5) * _PT_PER_MM)
     if pressure_enabled and pressures and len(pressures) == len(points):
         try:
-            widths = pressure_widths(pressures, base_pt, profile)
-            smooth_pts, smooth_widths = _smooth(points, widths)
-            outline = build_outline(smooth_pts, smooth_widths)
+            # Same silhouette engine as the canvas (one NonZero union),
+            # so a preview can never disagree with what the editor
+            # paints.
+            outline = stroke_silhouette(points, base_pt, pressures, profile)
         except ValueError:
             outline = None
         if outline is not None:
@@ -176,19 +178,19 @@ def _paint_ink(painter: QPainter, item, factor: float) -> None:
                                       True)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(base)
-                if outline.polygon:
-                    poly = QPolygonF([
-                        QPointF(float(p.x) * factor, float(p.y) * factor)
-                        for p in outline.polygon])
-                    path = QPainterPath()
-                    path.addPolygon(poly)
-                    path.setFillRule(Qt.FillRule.WindingFill)
-                    painter.fillPath(path, base)
-                for dot in (list(outline.dots) + list(outline.discs)):
+                path = QPainterPath()
+                for ring in outline.rings:
+                    path.addPolygon(QPolygonF([
+                        QPointF(float(x) * factor, float(y) * factor)
+                        for x, y in ring]))
+                for dot in outline.dots:
                     d = float(dot.radius) * factor
-                    painter.drawEllipse(
+                    path.addEllipse(
                         QPointF(float(dot.center.x) * factor,
                                 float(dot.center.y) * factor), d, d)
+                if not path.isEmpty():
+                    path.setFillRule(Qt.FillRule.WindingFill)
+                    painter.fillPath(path, base)
             finally:
                 painter.restore()
             return

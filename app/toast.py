@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
 from app import fx
-from app.icons import icon
+from app.icons import hd_pixmap, icon
 from app.theme.multilingual import font_for, local_direction
 from app.theme.tokens import InkfallTokens
 from app.theme.typography import role_font
@@ -94,7 +94,7 @@ class ToastHost(QWidget):
 
     def _apply_tokens(self, tokens: InkfallTokens) -> None:
         t = tokens
-        self._mark.setPixmap(icon("check", t.text_primary, 14).pixmap(16, 16))
+        self._mark.setPixmap(hd_pixmap(icon("check", t.text_primary, 14), 16))
         self._pill.setStyleSheet(
             f"background-color: {t.surface_overlay}; color: {t.text_primary};"
             f" border: 1px solid {t.border}; border-radius: 10px;"
@@ -110,8 +110,9 @@ class ToastHost(QWidget):
         self._label.setAccessibleDescription(full_tip)
         self._label.setFont(font_for(text, "body", self._tokens))
         self._label.setLayoutDirection(local_direction(text))
-        self._mark.setPixmap(icon(
-            "alert" if kind == "error" else "check", self._tokens.text_primary, 14).pixmap(16, 16))
+        self._mark.setPixmap(hd_pixmap(icon(
+            "alert" if kind == "error" else "check",
+            self._tokens.text_primary, 14), 16))
         self._pill.setVisible(True)
         fx.fade_in(self._pill, 160, self)
         lifetime = _LIFETIME_ERROR_MS if kind == "error" else _LIFETIME_MS

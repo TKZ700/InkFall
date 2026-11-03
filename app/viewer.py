@@ -61,6 +61,7 @@ from annotations.ink_geometry import (
     HIGHLIGHTER_BAND_ASPECT, SMOOTH_MIN_SPACING_PT, SMOOTH_PASSES,
     build_outline, highlighter_band_hulls, pressure_widths,
     smooth_centerline)
+from annotations.ink_silhouette import stroke_silhouette
 from annotations.models import (
     AnnotationBase,
     Highlighter,
@@ -312,6 +313,11 @@ _SELECT_DASH_CYCLE = _SELECT_DASH_ON + _SELECT_DASH_OFF
 #: screen px at the 2 px pen) and the pulse by one step of its period.
 _SELECT_ANIM_INTERVAL_MS = 33
 _SELECT_DASH_OFFSET_STEP = 0.5
+
+#: Upper bound on memoized per-stroke QPainterPaths (page coordinates).
+#: Paths are pure view-independent geometry, so they survive zoom/scroll;
+#: FIFO eviction keeps a huge document from pinning unbounded memory.
+_PATH_MEMO_MAX = 512
 
 #: M6.8.1: the pulse is a slow, bounded opacity breathing (never a harsh
 #: flash, never a full disappearance). ``_SELECT_PULSE_PERIOD_TICKS`` at
@@ -808,6 +814,55 @@ class _CursorResetFilter(QAbstractNativeEventFilter):
             return False
 
 
+class _SelectionFrameOverlay(QWidget):
+    """Transparent child that paints the shared selection frame.
+
+    The marching-ants animation used to invalidate the *viewer*, so every
+    tick (~30 fps) repainted all page tiles and every annotation inside the
+    frame box. On a dense page that single paint measured ~70 ms, which
+    saturated the GUI thread for as long as a selection existed — the
+    "selecting freezes the app on big PDFs" report.
+
+    Painting the frame on its own translucent layer means a tick repaints
+    only this widget; the document content underneath is never re-rendered.
+    The frame geometry, pens, handles and clipping are all the viewer's own
+    (``PdfViewer._paint_selection_frame``), so the drawing is identical.
+    """
+
+    def __init__(self, viewer) -> None:
+        super().__init__(viewer)
+        self._viewer = viewer
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+                          True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.hide()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Paint the viewer-owned frame onto this transparent layer."""
+        painter = QPainter(self)
+        try:
+            if not painter.isActive():
+                return
+            try:
+                dirty = event.region().boundingRect()
+                if dirty.isNull():
+                    raise ValueError("empty dirty region")
+            except Exception:
+                dirty = self.rect()
+            self._viewer._paint_selection_frame(painter, dirty)
+        except Exception:
+            pass
+        finally:
+            try:
+                if painter.isActive():
+                    painter.end()
+            except Exception:
+                pass
+
+
 class PdfViewer(QWidget):
     """Document viewer: scroll/zoom/paint over a ``DocumentPipeline``."""
 
@@ -1043,6 +1098,15 @@ class PdfViewer(QWidget):
         # with it in close_document. Completed-outline entries are
         # unbounded in principle but one per stroke, like the cache.
         self._bbox_memo: dict = {}
+        # Per-stroke QPainterPath memo, keyed by id() of the cached outline
+        # with a strong ref (no id-reuse hazard). Paths are built in PAGE
+        # coordinates and mapped by the painter transform, so they survive
+        # zoom/scroll; rebuilding a dense stroke's rings on every repaint
+        # was the bulk of a slow page paint.
+        self._path_memo: dict = {}
+        # Page-id -> layout index map for the current layout (built once per
+        # layout; see _page_index_for).
+        self._page_index_cache = None
         # B.2.8: single-slot live-geometry memos (identity-keyed, fixed
         # size — never unbounded). The live outline object is replaced
         # on every state-changing append and the live InkStroke on every
@@ -1183,6 +1247,13 @@ class PdfViewer(QWidget):
         self._selection_timer.setInterval(_SELECT_ANIM_INTERVAL_MS)
         self._selection_timer.timeout.connect(
             self._advance_selection_animation)
+        # The frame animation paints on this transparent child, never on the
+        # viewer itself: a tick is O(frame), not O(page). Created here (after
+        # the scrollbars) so it is a sibling overlay; it is mouse-transparent
+        # and repainted only when a selection frame is shown.
+        self._selection_overlay = _SelectionFrameOverlay(self)
+        self._selection_overlay.setGeometry(self.rect())
+        self._selection_overlay.raise_()
         # M6.8.1 Pan selection: a stationary press *outside* the shared
         # frame clears immediately (no deferred timer — the previous
         # design's single/double-click ambiguity delay is gone). A press
@@ -3192,6 +3263,8 @@ class PdfViewer(QWidget):
             self._outline_cache = {}
             self._off_smooth_cache = {}
             self._bbox_memo = {}
+            self._path_memo = {}
+            self._page_index_cache = None
             self._live_prev_rect = None
             self._live_full_rect = None
             self._live_meta = None
@@ -3653,6 +3726,13 @@ class PdfViewer(QWidget):
                                   scroll_x_doc=self._scroll_doc_x())
         except Exception:
             pass  # closed/pressure paths are counted pipeline-side
+        # The frame lives on its own transparent layer: a view move must
+        # refresh that layer too (cheap — it only draws the loop).
+        try:
+            if self._selection_overlay.isVisible():
+                self._selection_overlay.update()
+        except Exception:
+            pass
 
     def set_zoom(self, ui_zoom: float) -> float:
         """Apply continuous UI zoom; returns the clamped value."""
@@ -4111,6 +4191,11 @@ class PdfViewer(QWidget):
         self._hscrollbar.setGeometry(
             0, self.height() - bar_height,
             max(0, self.width() - bar_width), bar_height)
+        try:
+            self._selection_overlay.setGeometry(self.rect())
+            self._selection_overlay.raise_()
+        except Exception:
+            pass
         self._position_shelf()
         # M5-B.1.2: re-anchor horizontal to the pre-resize viewport
         # center (same zoom, new width); falls back to fraction.
@@ -8979,11 +9064,47 @@ class PdfViewer(QWidget):
                 self._selection_timer.stop()
         except Exception:
             pass
+        self._sync_selection_overlay()
+
+    def _sync_selection_overlay(self) -> None:
+        """Show/hide the transparent frame layer to match the frame state.
+
+        Idempotent and cheap: the layer is only shown while a frame is
+        painted (and the viewer itself is visible) and only repainted when
+        it actually is on screen.
+        """
+        try:
+            overlay = self._selection_overlay
+        except AttributeError:
+            return
+        try:
+            wanted = self._selection_frame_visible() and self.isVisible()
+        except Exception:
+            wanted = False
+        try:
+            if not wanted:
+                if overlay.isVisible():
+                    overlay.hide()
+                return
+            if overlay.geometry() != self.rect():
+                overlay.setGeometry(self.rect())
+            if not overlay.isVisible():
+                overlay.show()
+                overlay.raise_()
+                # One repaint for the newly shown layer; an already-visible
+                # layer is refreshed by the frame tick or the parent paint.
+                overlay.update()
+        except Exception:
+            pass
 
     def _stop_selection_animation(self) -> None:
         """Stop the frame animation (document close / teardown / hide)."""
         try:
             self._selection_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._selection_overlay.hide()
         except Exception:
             pass
 
@@ -8995,6 +9116,21 @@ class PdfViewer(QWidget):
                 return
             self._selection_phase = float(self._selection_phase) + 1.0
             box = self._selection_frame_screen_box()
+            try:
+                overlay = self._selection_overlay
+                on_overlay = overlay.isVisible()
+            except Exception:
+                overlay = None
+                on_overlay = False
+            if on_overlay:
+                # Repaint ONLY the transparent frame layer: the page tiles
+                # and annotations under it are untouched, so a tick costs
+                # the loop instead of a whole page render.
+                if box is not None:
+                    overlay.update(box)
+                else:
+                    overlay.update()
+                return
             if box is not None:
                 self.update(box)
             else:
@@ -9676,13 +9812,24 @@ class PdfViewer(QWidget):
         try:
             key = getattr(page_id, "value", page_id)
             layout = self._pipeline.layout
-            for index in range(layout.page_count):
-                if getattr(getattr(layout.entry(index), "page_id", None),
-                           "value", None) == key:
-                    return index
+            cache = self._page_index_cache
+            if cache is None or cache[0] is not layout:
+                # Built once per layout: the selection frame used to re-scan
+                # every page for *each* selected id, which is quadratic on a
+                # big document (a large selection froze the app).
+                mapping = {}
+                for index in range(layout.page_count):
+                    try:
+                        entry = layout.entry(index)
+                    except Exception:
+                        continue
+                    mapping[getattr(getattr(entry, "page_id", None),
+                                    "value", None)] = index
+                self._page_index_cache = (layout, mapping)
+                cache = self._page_index_cache
+            return cache[1].get(key)
         except Exception:
             return None
-        return None
 
     @staticmethod
     def _annotation_has_geometry(annotation) -> bool:
@@ -12479,6 +12626,8 @@ class PdfViewer(QWidget):
             self._outline_cache = {}
             self._off_smooth_cache = {}
             self._bbox_memo = {}
+            self._path_memo = {}
+            self._page_index_cache = None
             self._tablet_hover_pt = None
             self._pen_forward_target = None
             self._pen_last_tap = None
@@ -13118,7 +13267,18 @@ class PdfViewer(QWidget):
         try:
             from PySide6.QtGui import QIcon, QPainter, QPixmap
 
-            pixmap = QPixmap(int(size), int(size))
+            # Rasterize for the display's physical pixels: a logical-size
+            # chip was upscaled by the painter on a scaled display, which
+            # is what made the palette swatches look soft.
+            try:
+                dpr = float(self.devicePixelRatioF() or 1.0)
+            except Exception:
+                dpr = 1.0
+            if not 0.0 < dpr < 8.0:
+                dpr = 1.0
+            px = max(1, int(round(float(size) * dpr)))
+            pixmap = QPixmap(px, px)
+            pixmap.setDevicePixelRatio(dpr)
             pixmap.fill(Qt.GlobalColor.transparent)
             painter = QPainter(pixmap)
             try:
@@ -13927,8 +14087,15 @@ class PdfViewer(QWidget):
             self._sync_selection_animation()
             # M6.8.1: the single shared selection frame is drawn in widget
             # space (it can span pages and the gaps between them), above
-            # every annotation layer, clipped to the viewport.
-            self._paint_selection_frame(painter, dirty)
+            # every annotation layer, clipped to the viewport. It normally
+            # lives on the transparent overlay (so animation ticks repaint
+            # only the frame, never the page); this inline path covers the
+            # frames painted before that overlay is up.
+            try:
+                if not self._selection_overlay.isVisible():
+                    self._paint_selection_frame(painter, dirty)
+            except Exception:
+                self._paint_selection_frame(painter, dirty)
             # M6.8.1: the live marquee/lasso overlay is widget-space (it
             # can span pages and gaps) and paints above everything.
             self._paint_region_gesture_overlay(painter, dirty)
@@ -14070,18 +14237,14 @@ class PdfViewer(QWidget):
         if not (math.isfinite(base_pt) and base_pt > 0.0):
             return None
         try:
-            # B.2.3: latched response profile; unknown values fall back
-            # to the legacy path via ValueError (never lose ink).
-            widths = pressure_widths(
-                tuple(pressures), base_pt,
+            # Latched response profile; unknown values fall back to the
+            # legacy path via ValueError (never lose ink). The whole
+            # visual pipeline (pressure map, width conditioning,
+            # corner-preserving smoothing, resampling, tangent spans,
+            # NonZero union) lives in ``annotations.ink_silhouette``.
+            return stroke_silhouette(
+                points, base_pt, tuple(pressures),
                 getattr(stroke, "pressure_profile", "normal"))
-            # B.2.2: render-geometry smoothing on copies; raw samples
-            # stay the source of truth.
-            smooth_pts, smooth_widths = smooth_centerline(
-                [(p.x, p.y) for p in points], widths)
-            return build_outline(
-                smooth_pts, smooth_widths if smooth_widths is not None
-                else widths)
         except ValueError:
             return None
 
@@ -14111,6 +14274,54 @@ class PdfViewer(QWidget):
             except Exception:
                 pass
         return outline
+
+    def _stroke_path(self, outline):
+        """One cached ``QPainterPath`` per outline, in PAGE coordinates.
+
+        View-independent by construction (the painter applies the page
+        origin and factor), so a stroke's rings are built once instead of
+        on every repaint — a dense page spent most of a paint rebuilding
+        identical polygons. Identity-checked entries make a recycled
+        ``id()`` harmless; FIFO eviction bounds memory.
+        """
+        try:
+            memo = self._path_memo
+            entry = memo.get(id(outline))
+        except Exception:
+            memo = None
+            entry = None
+        if entry is not None and entry[0] is outline:
+            return entry[1]
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPainterPath
+
+        path = QPainterPath()
+        try:
+            rings = getattr(outline, "rings", None)
+            if rings:
+                for ring in rings:
+                    path.addPolygon(QPolygonF([
+                        QPointF(float(x), float(y)) for x, y in ring]))
+            elif getattr(outline, "polygon", None):
+                path.addPolygon(QPolygonF([
+                    QPointF(float(p.x), float(p.y))
+                    for p in outline.polygon]))
+            for dot in (list(getattr(outline, "dots", ()) or ())
+                        + list(getattr(outline, "discs", ()) or ())):
+                r = float(dot.radius)
+                path.addEllipse(QPointF(float(dot.center.x),
+                                        float(dot.center.y)), r, r)
+            path.setFillRule(Qt.FillRule.WindingFill)
+        except Exception:
+            return path
+        if memo is not None:
+            try:
+                if len(memo) >= _PATH_MEMO_MAX:
+                    memo.pop(next(iter(memo)), None)
+                memo[id(outline)] = (outline, path)
+            except Exception:
+                pass
+        return path
 
     @staticmethod
     def _outline_page_extents(outline):
@@ -15317,7 +15528,6 @@ class PdfViewer(QWidget):
             return
         try:
             from PySide6.QtCore import QPointF, QRectF
-            from PySide6.QtGui import QPainterPath
 
             painter.save()
             try:
@@ -15443,24 +15653,29 @@ class PdfViewer(QWidget):
                                 QPainter.RenderHint.Antialiasing, True)
                             painter.setPen(Qt.PenStyle.NoPen)
                             painter.setBrush(base)
-                            if outline.polygon:
-                                poly = QPolygonF([QPointF(
-                                    float(page_rect.x) + float(p.x) * factor,
-                                    float(page_rect.y) + float(p.y) * factor)
-                                    for p in outline.polygon])
-                                path = QPainterPath()
-                                path.addPolygon(poly)
-                                path.setFillRule(Qt.FillRule.WindingFill)
-                                painter.fillPath(path, base)
-                            for dot in (list(outline.dots)
-                                        + list(outline.discs)):
-                                d = float(dot.radius) * factor
-                                c = QPointF(
-                                    float(page_rect.x)
-                                    + float(dot.center.x) * factor,
-                                    float(page_rect.y)
-                                    + float(dot.center.y) * factor)
-                                painter.drawEllipse(c, d, d)
+                            ox = float(page_rect.x)
+                            oy = float(page_rect.y)
+                            # NonZero union: every ring of the
+                            # silhouette (spans, joint discs, caps) and
+                            # every dot is a sub-path of ONE path that
+                            # is filled exactly once, so overlaps merge
+                            # instead of double-blending a translucent
+                            # stroke, and joins cannot notch.
+                            path = self._stroke_path(outline)
+                            if not path.isEmpty():
+                                # The memoized path is page-space; the painter
+                                # maps it (identical geometry to mapping every
+                                # point, without rebuilding the rings).
+                                painter.save()
+                                try:
+                                    painter.translate(ox, oy)
+                                    painter.scale(factor, factor)
+                                    painter.fillPath(path, base)
+                                finally:
+                                    try:
+                                        painter.restore()
+                                    except Exception:
+                                        pass
                         finally:
                             try:
                                 painter.restore()

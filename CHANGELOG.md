@@ -3,6 +3,38 @@
 All notable changes to this preview are recorded here. The project version
 lives in `pyproject.toml`; entries below use that version.
 
+## 0.1.2 — alpha
+
+Ink engine finish, selection responsiveness in large documents, and a sharp
+UI on scaled displays.
+
+### Ink
+
+- Completed the ink engine split into an explicit geometry engine
+  (`annotations/ink_engine.py`) and its paint holder
+  (`annotations/ink_silhouette.py`); the live preview, the commit path and the
+  acceptance harness all run against the silhouette, and the L2 parity gate
+  compares the pen's real paint holder instead of the retired outline object.
+
+### Application fixes
+
+- Selecting annotations in large PDFs no longer freezes the viewer: the
+  selection frame animates on its own transparent layer instead of forcing a
+  full repaint of every stroke thirty times a second, and annotation lookups
+  use a per-layout page index instead of scanning every page for each id.
+- Stroke painting reuses a bounded per-stroke path cache, so repeated
+  repaints of an annotated page no longer rebuild every outline.
+
+### UI quality
+
+- Icons, the brand mark, toolbar and tabbar glyphs, library thumbnails and
+  the rotate cursor are now rasterized at the display's physical pixel ratio
+  (vector icons render per requested size) instead of being drawn at logical
+  size and upscaled — the source of the soft, slightly blurred UI on 125%
+  and higher displays. Layout sizes are unchanged.
+- The PDF rendering pipeline is unchanged; its raster strategy stays exactly
+  as decided.
+
 ## 0.1.1 — alpha
 
 Stability, build and save-flow fixes.

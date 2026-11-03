@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import fx as _fx
+from app.icons import logical_size as _icon_size
 from app.icons import pixmap as _pixmap
 from app.theme.tokens import InkfallTokens
 from app.toolshelf.surfaces import (
@@ -401,7 +402,8 @@ class _IconLineEdit(QLineEdit):
                     QPainter.RenderHint.SmoothPixmapTransform, True)
                 if not self.isEnabled():
                     painter.setOpacity(0.45)
-                y = int(round((self.height() - pix.height()) / 2.0))
+                _pix_w, _pix_h = _icon_size(pix)
+                y = int(round((self.height() - _pix_h) / 2.0))
                 painter.drawPixmap(self.ICON_LEFT, y, pix)
             finally:
                 painter.end()

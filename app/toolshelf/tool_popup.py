@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import fx as _fx
+from app.icons import logical_size as _icon_size
 from app.icons import pixmap as _icon_pixmap
 from app.icons import ink_center_offset as _ink_offset
 from app.icons import tool_pixmap as _tool_pixmap
@@ -285,8 +286,9 @@ class _Preview(QWidget):
                         dx, dy = _ink_offset(glyph)
                     except Exception:
                         dx, dy = (0.0, 0.0)
-                    painter.drawPixmap(int(round(cx - glyph.width() / 2 + dx)),
-                                       int(round(cy - glyph.height() / 2 + dy)),
+                    glyph_w, glyph_h = _icon_size(glyph)
+                    painter.drawPixmap(int(round(cx - glyph_w / 2 + dx)),
+                                       int(round(cy - glyph_h / 2 + dy)),
                                        glyph)
                 else:
                     painter.setPen(Qt.PenStyle.NoPen)
@@ -4378,9 +4380,10 @@ class _TrashButton(QAbstractButton):
                     _dx, _dy = _ink_offset(glyph)
                 except Exception:
                     _dx, _dy = (0.0, 0.0)
+                glyph_w, glyph_h = _icon_size(glyph)
                 painter.drawPixmap(
-                    int(round(cx - glyph.width() / 2.0 + _dx)),
-                    int(round(cy - glyph.height() / 2.0 + _dy)), glyph)
+                    int(round(cx - glyph_w / 2.0 + _dx)),
+                    int(round(cy - glyph_h / 2.0 + _dy)), glyph)
         except Exception:
             pass
         finally:
@@ -5034,8 +5037,9 @@ class _AddCell(QAbstractButton):
                 # Float zone center (see _Preview): no truncation shift.
                 _tcx = icon_zone.left() + icon_zone.width() / 2.0
                 _tcy = icon_zone.top() + icon_zone.height() / 2.0
-                gx = _tcx - glyph.width() / 2 + _dx
-                gy = _tcy - glyph.height() / 2 + _dy
+                glyph_w, glyph_h = _icon_size(glyph)
+                gx = _tcx - glyph_w / 2 + _dx
+                gy = _tcy - glyph_h / 2 + _dy
                 painter.drawPixmap(int(round(gx)), int(round(gy)), glyph)
             # Add affordance: the same small monochrome plus on every
             # card (brighter on hover/focus); the whole card remains the

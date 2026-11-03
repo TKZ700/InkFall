@@ -16,7 +16,9 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QWidget
 
+from app.icons import hd_pixmap as _hd_pixmap
 from app.icons import icon as _icon
+from app.icons import logical_size as _icon_size
 from app.theme.tokens import InkfallTokens
 
 __all__ = ["UndoRedoCapsule", "HUD_MARGIN"]
@@ -149,10 +151,14 @@ class _CapsuleHalf(QAbstractButton):
                            float(circle[2]), float(circle[3])),
                     self._tokens, radius=None)
             try:
-                glyph = _icon(self._icon_name,
-                              self._glyph_color().name(), 18).pixmap(18, 18)
+                glyph = _hd_pixmap(
+                    _icon(self._icon_name,
+                          self._glyph_color().name(), 18), 18)
                 if not glyph.isNull():
-                    painter.drawPixmap(cx - 9, cy - 9, glyph)
+                    glyph_w, glyph_h = _icon_size(glyph)
+                    painter.drawPixmap(int(round(cx - glyph_w / 2.0)),
+                                       int(round(cy - glyph_h / 2.0)),
+                                       glyph)
             except Exception:
                 pass
         finally:

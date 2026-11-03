@@ -23,6 +23,7 @@ from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QAbstractButton
 
 from app.icons import ink_center_offset as _ink_offset
+from app.icons import logical_size as _icon_size
 from app.icons import pixmap as _icon_pixmap
 from app.icons import tool_pixmap as _tool_pixmap
 from app.theme.tokens import InkfallTokens
@@ -602,15 +603,16 @@ class SlotButton(QAbstractButton):
         try:
             cx = rect.left() + rect.width() / 2.0
             cy = rect.top() + rect.height() / 2.0
-            x = cx - glyph.width() / 2.0 + dx
-            y = cy - glyph.height() / 2.0 + dy + extra_dy
+            glyph_w, glyph_h = _icon_size(glyph)
+            x = cx - glyph_w / 2.0 + dx
+            y = cy - glyph_h / 2.0 + dy + extra_dy
             # The neighbour separation is a content offset larger than this
             # cell's own padding, so clamp the drawn pixmap into the tile:
             # only the last row of a maximum-size glyph is ever affected,
             # and the glyph is never cut by the cell edge.
             try:
-                x = max(0.0, min(float(CELL) - glyph.width(), x))
-                y = max(0.0, min(float(CELL) - glyph.height(), y))
+                x = max(0.0, min(float(CELL) - glyph_w, x))
+                y = max(0.0, min(float(CELL) - glyph_h, y))
             except Exception:
                 pass
             painter.drawPixmap(int(round(x)), int(round(y)), glyph)

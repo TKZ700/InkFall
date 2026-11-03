@@ -22,6 +22,7 @@ from PySide6.QtCore import QModelIndex, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
+from app.icons import logical_size as icon_size
 from app.icons import pixmap as icon_pixmap
 from app.library.qt_model import Role
 from app.theme.multilingual import font_for
@@ -297,13 +298,26 @@ class LibraryDelegate(QStyledItemDelegate):
         thumb = image[0] if isinstance(image, tuple) else image
         if thumb is not None and not (hasattr(thumb, "isNull") and thumb.isNull()):
             pix = QPixmap.fromImage(thumb) if not isinstance(thumb, QPixmap) else thumb
+            # Rasterize the hero thumbnail for the display's physical
+            # pixels: scaling to the logical target and letting the painter
+            # upscale by the device ratio was the "library thumbnails look
+            # blurry" path.
+            try:
+                dpr = float(painter.device().devicePixelRatioF() or 1.0)
+            except Exception:
+                dpr = 1.0
+            if not 0.0 < dpr < 8.0:
+                dpr = 1.0
             scaled = pix.scaled(
-                target.size(),
+                max(1, int(round(target.width() * dpr))),
+                max(1, int(round(target.height() * dpr))),
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = target.x() + (target.width() - scaled.width()) // 2
-            y = target.y() + (target.height() - scaled.height()) // 2
+            scaled.setDevicePixelRatio(dpr)
+            scaled_w, scaled_h = icon_size(scaled)
+            x = target.x() + int(round((target.width() - scaled_w) / 2.0))
+            y = target.y() + int(round((target.height() - scaled_h) / 2.0))
             painter.drawPixmap(x, y, scaled)
             if missing:
                 painter.fillRect(target, QColor(0, 0, 0, 110))
@@ -311,9 +325,10 @@ class LibraryDelegate(QStyledItemDelegate):
             painter.fillRect(target, QColor(t.thumb_placeholder))
             mark = self._icons.get("alert" if failed else "empty")
             if mark is not None:
+                mark_w, mark_h = icon_size(mark)
                 painter.drawPixmap(
-                    target.x() + (target.width() - mark.width()) // 2,
-                    target.y() + (target.height() - mark.height()) // 2 - 8,
+                    target.x() + int((target.width() - mark_w) // 2),
+                    target.y() + int((target.height() - mark_h) // 2) - 8,
                     mark,
                 )
             painter.setPen(QColor(t.text_muted))
@@ -332,9 +347,10 @@ class LibraryDelegate(QStyledItemDelegate):
             painter.drawEllipse(badge)
             glyph = self._icons.get("retry")
             if glyph is not None:
+                glyph_w, glyph_h = icon_size(glyph)
                 painter.drawPixmap(
-                    badge.x() + (badge.width() - glyph.width()) // 2,
-                    badge.y() + (badge.height() - glyph.height()) // 2,
+                    badge.x() + int((badge.width() - glyph_w) // 2),
+                    badge.y() + int((badge.height() - glyph_h) // 2),
                     glyph,
                 )
             painter.restore()
@@ -738,8 +754,10 @@ class LibraryDelegate(QStyledItemDelegate):
         painter.drawPath(plate_path)
         painter.setPen(pen)
         mark = self._folder_icon(color.name(), 48)
-        painter.drawPixmap(plate.x() + (plate.width() - mark.width()) // 2,
-                           plate.y() + (plate.height() - mark.height()) // 2, mark)
+        mark_w, mark_h = icon_size(mark)
+        painter.drawPixmap(plate.x() + int((plate.width() - mark_w) // 2),
+                           plate.y() + int((plate.height() - mark_h) // 2),
+                           mark)
         if selected:
             ring = QPainterPath()
             ring.addRoundedRect(plate.adjusted(-2, -2, 2, 2), 10, 10)
@@ -800,8 +818,10 @@ class LibraryDelegate(QStyledItemDelegate):
         painter.drawPath(plate_path)
         painter.setPen(pen)
         mark = self._folder_icon(color.name(), 24)
-        painter.drawPixmap(plate.x() + (plate.width() - mark.width()) // 2,
-                           plate.y() + (plate.height() - mark.height()) // 2, mark)
+        mark_w, mark_h = icon_size(mark)
+        painter.drawPixmap(plate.x() + int((plate.width() - mark_w) // 2),
+                           plate.y() + int((plate.height() - mark_h) // 2),
+                           mark)
         if selected:
             ring = QPainterPath()
             ring.addRoundedRect(plate.adjusted(-2, -2, 2, 2), 9, 9)

@@ -238,9 +238,16 @@ def test_viewer_pressure_path_uses_smoothing():
         widths = pressure_widths(tuple(0.5 for _ in pts),
                                  3.0 * 72.0 / 25.4)
         raw_outline = build_outline([(x, y) for x, y in raw], widths)
+
+        def _rail_rms(polygon):
+            # Typical rail deviation, not the single extreme vertex: the
+            # stroke's first/last samples are pinned (the pen touched and
+            # lifted there), so a max-only measure cannot show smoothing.
+            return math.sqrt(sum(p.y * p.y for p in polygon)
+                             / len(polygon))
+
         smooth_max = max(abs(p.y) for p in outline.polygon)
-        raw_max = max(abs(p.y) for p in raw_outline.polygon)
-        assert smooth_max < raw_max  # rails calm down at paint time
+        assert _rail_rms(outline.polygon) < _rail_rms(raw_outline.polygon)
         assert smooth_max <= max(widths) / 2.0 + 1.0
     finally:
         viewer.close()

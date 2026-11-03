@@ -83,16 +83,15 @@ def test_live_outline_matches_full_on_every_update():
 
 
 def _oracle_for(pen):
-    from annotations.ink_geometry import build_outline, smooth_centerline
-    from annotations.interaction import PenHandler as _PH  # noqa: F401
+    """Full rebuild of the live stroke through the render engine."""
+    from annotations.ink_geometry import pressure_width
+    from annotations.ink_silhouette import silhouette
 
     pts = [(p.x, p.y) for p in pen._points]
     base = float(pen._width_mm) * 72.0 / 25.4
-    from annotations.ink_geometry import pressure_width
     widths = tuple(pressure_width(p, base, pen._stroke_profile)
                    for p in pen._pressures)
-    spts, svals = smooth_centerline(pts, widths)
-    return build_outline(spts, svals if svals is not None else widths)
+    return silhouette(pts, widths)
 
 
 def test_midstroke_width_edit_refeeds_exactly():
