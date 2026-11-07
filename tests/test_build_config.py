@@ -18,8 +18,8 @@ import pytest
 from scripts import build_config
 from scripts.build import required_entries
 from scripts.build_config import (
-    BuildError,
     SOURCE_ROOT,
+    BuildError,
     ensure_native,
     linux_archive_name,
     linux_archive_root,
@@ -53,33 +53,41 @@ def test_visible_product_name_is_exact() -> None:
     # user-visible product name changes.
     assert standalone_binary_name("windows") == "Inkfall.exe"
     args = nuitka_arguments(
-        "windows", project_version(), source_root=SOURCE_ROOT,
-        build_root=Path("build"), dist_dir=Path("dist"))
+        "windows",
+        project_version(),
+        source_root=SOURCE_ROOT,
+        build_root=Path("build"),
+        dist_dir=Path("dist"),
+    )
     assert "--product-name=InkFall" in args
     assert "--file-description=InkFall" in args
 
 
 def test_windows_installer_creates_both_shortcuts() -> None:
     args = nuitka_arguments(
-        "windows", project_version(), source_root=SOURCE_ROOT,
-        build_root=Path("build"), dist_dir=Path("dist"))
+        "windows",
+        project_version(),
+        source_root=SOURCE_ROOT,
+        build_root=Path("build"),
+        dist_dir=Path("dist"),
+    )
     shortcuts = [
-        arg.split("=", 1)[1] for arg in args
+        arg.split("=", 1)[1]
+        for arg in args
         if arg.startswith("--windows-installer-shortcuts=")
     ]
     assert shortcuts == ["desktop,start-menu"]
 
 
 def test_project_version_is_preview_version() -> None:
-    assert project_version() == "0.1.2"
+    assert project_version() == "0.1.3"
 
 
 def test_artifact_names_are_exact() -> None:
     version = project_version()
-    assert windows_installer_name(version) == (
-        "Inkfall-0.1.2-windows-x86_64-setup.exe")
-    assert linux_archive_name(version) == "inkfall-0.1.2-linux-x86_64.tar.gz"
-    assert linux_archive_root(version) == "inkfall-0.1.2-linux-x86_64"
+    assert windows_installer_name(version) == ("Inkfall-0.1.3-windows-x86_64-setup.exe")
+    assert linux_archive_name(version) == "inkfall-0.1.3-linux-x86_64.tar.gz"
+    assert linux_archive_root(version) == "inkfall-0.1.3-linux-x86_64"
 
 
 def test_artifact_paths_use_version_and_dist_dir(tmp_path: Path) -> None:
@@ -104,8 +112,12 @@ def test_windows_nuitka_arguments(tmp_path: Path) -> None:
     build_root = tmp_path / "build"
     dist_dir = tmp_path / "dist"
     args = nuitka_arguments(
-        "windows", version, source_root=SOURCE_ROOT,
-        build_root=build_root, dist_dir=dist_dir)
+        "windows",
+        version,
+        source_root=SOURCE_ROOT,
+        build_root=build_root,
+        dist_dir=dist_dir,
+    )
 
     assert "--mode=standalone" in args
     assert "--enable-plugins=pyside6" in args
@@ -121,10 +133,12 @@ def test_windows_nuitka_arguments(tmp_path: Path) -> None:
     assert "--windows-installer-shortcuts=desktop,start-menu" in args
     assert "--windows-installer-mode=user" in args
     assert "--windows-console-mode=disable" in args
-    assert (f"--windows-icon-from-ico="
-            f"{SOURCE_ROOT / build_config.WINDOWS_ICON}") in args
-    assert (f"--windows-installer-output="
-            f"{dist_dir / windows_installer_name(version)}") in args
+    assert (
+        f"--windows-icon-from-ico={SOURCE_ROOT / build_config.WINDOWS_ICON}"
+    ) in args
+    assert (
+        f"--windows-installer-output={dist_dir / windows_installer_name(version)}"
+    ) in args
     assert args[-1] == str(SOURCE_ROOT / "main.py")
 
 
@@ -139,11 +153,19 @@ def test_windows_low_memory_c_compilation_is_requested(tmp_path: Path) -> None:
     """
     version = project_version()
     windows_args = nuitka_arguments(
-        "windows", version, source_root=SOURCE_ROOT,
-        build_root=tmp_path / "win", dist_dir=tmp_path / "win")
+        "windows",
+        version,
+        source_root=SOURCE_ROOT,
+        build_root=tmp_path / "win",
+        dist_dir=tmp_path / "win",
+    )
     linux_args = nuitka_arguments(
-        "linux", version, source_root=SOURCE_ROOT,
-        build_root=tmp_path / "linux", dist_dir=tmp_path / "linux")
+        "linux",
+        version,
+        source_root=SOURCE_ROOT,
+        build_root=tmp_path / "linux",
+        dist_dir=tmp_path / "linux",
+    )
 
     assert "--low-memory" in windows_args
     assert "--low-memory" not in linux_args
@@ -162,16 +184,23 @@ def test_windows_pymupdf_ships_as_frozen_bytecode(tmp_path: Path) -> None:
     must keep resolving as binaries the build ships as-is.
     """
     windows_args = nuitka_arguments(
-        "windows", project_version(), source_root=SOURCE_ROOT,
-        build_root=tmp_path / "win", dist_dir=tmp_path / "win")
+        "windows",
+        project_version(),
+        source_root=SOURCE_ROOT,
+        build_root=tmp_path / "win",
+        dist_dir=tmp_path / "win",
+    )
     linux_args = nuitka_arguments(
-        "linux", project_version(), source_root=SOURCE_ROOT,
-        build_root=tmp_path / "linux", dist_dir=tmp_path / "linux")
+        "linux",
+        project_version(),
+        source_root=SOURCE_ROOT,
+        build_root=tmp_path / "linux",
+        dist_dir=tmp_path / "linux",
+    )
 
     flag = "--noinclude-custom-mode=pymupdf:bytecode"
     assert flag in windows_args
-    assert not [arg for arg in linux_args if arg.startswith(
-        "--noinclude-custom-mode")]
+    assert not [arg for arg in linux_args if arg.startswith("--noinclude-custom-mode")]
     # The flag names a real module layout: the pure-Python wrapper this
     # targets and the native extensions that must ship alongside it.
     assert importlib.util.find_spec("pymupdf.mupdf") is not None
@@ -182,8 +211,12 @@ def test_qml_plugin_family_is_requested_explicitly(tmp_path: Path) -> None:
     """QML data files need the qml plugin family declared up front."""
     for platform in ("windows", "linux"):
         args = nuitka_arguments(
-            platform, project_version(), source_root=SOURCE_ROOT,
-            build_root=tmp_path / platform, dist_dir=tmp_path / platform)
+            platform,
+            project_version(),
+            source_root=SOURCE_ROOT,
+            build_root=tmp_path / platform,
+            dist_dir=tmp_path / platform,
+        )
         assert "--include-qt-plugins=qml" in args
         assert build_config.QT_PLUGIN_FAMILIES == ("qml",)
 
@@ -197,10 +230,15 @@ def test_windows_icon_argument_points_at_the_generated_ico() -> None:
 
 
 def test_linux_nuitka_arguments_contain_no_windows_or_package_flags(
-        tmp_path: Path) -> None:
+    tmp_path: Path,
+) -> None:
     args = nuitka_arguments(
-        "linux", project_version(), source_root=SOURCE_ROOT,
-        build_root=tmp_path / "build", dist_dir=tmp_path / "dist")
+        "linux",
+        project_version(),
+        source_root=SOURCE_ROOT,
+        build_root=tmp_path / "build",
+        dist_dir=tmp_path / "dist",
+    )
 
     assert "--mode=standalone" in args
     assert "--enable-plugins=pyside6" in args
@@ -267,14 +305,10 @@ def test_qt_core_library_pattern_matches_each_platform_naming() -> None:
 
 def test_qt_plugins_live_below_the_pyside6_package() -> None:
     """Nuitka's PySide6 plugin copies Qt plugins to PySide6/qt-plugins."""
-    assert (
-        "PySide6/qt-plugins/platforms/qwindows.dll"
-        in required_bundle_entries("windows")
+    assert "PySide6/qt-plugins/platforms/qwindows.dll" in required_bundle_entries(
+        "windows"
     )
-    assert (
-        "PySide6/qt-plugins/platforms/libqxcb.so"
-        in required_bundle_entries("linux")
-    )
+    assert "PySide6/qt-plugins/platforms/libqxcb.so" in required_bundle_entries("linux")
 
 
 def test_missing_bundle_entries_reports_everything(tmp_path: Path) -> None:
@@ -300,13 +334,13 @@ def test_missing_bundle_entries_accepts_glob_matches(tmp_path: Path) -> None:
     ["assets/icons/new_icon.png", build_config.WINDOWS_ICON],
 )
 def test_missing_current_brand_asset_fails_standalone_verification(
-        tmp_path: Path, missing_asset: str) -> None:
+    tmp_path: Path, missing_asset: str
+) -> None:
     """Either current brand asset is genuinely required at runtime."""
     for entry in required_bundle_entries("windows"):
         if entry == missing_asset:
             continue
-        target = tmp_path / (
-            "Qt6Core.dll" if entry == "**/Qt6Core.dll" else entry)
+        target = tmp_path / ("Qt6Core.dll" if entry == "**/Qt6Core.dll" else entry)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"")
 
@@ -314,10 +348,10 @@ def test_missing_current_brand_asset_fails_standalone_verification(
 
 
 def test_archive_required_entries_include_launcher() -> None:
-    entries = required_entries("linux", "inkfall-0.1.2-linux-x86_64")
-    assert "inkfall-0.1.2-linux-x86_64/inkfall" in entries
-    assert "inkfall-0.1.2-linux-x86_64/Inkfall" in entries
-    assert all("inkfall-0.1.2-linux-x86_64/" in entry for entry in entries)
+    entries = required_entries("linux", "inkfall-0.1.3-linux-x86_64")
+    assert "inkfall-0.1.3-linux-x86_64/inkfall" in entries
+    assert "inkfall-0.1.3-linux-x86_64/Inkfall" in entries
+    assert all("inkfall-0.1.3-linux-x86_64/" in entry for entry in entries)
 
 
 def test_linux_build_code_never_mentions_deb_or_rpm() -> None:
@@ -349,8 +383,7 @@ def test_main_routes_self_test() -> None:
     assert "run_self_test" in source
 
 
-@pytest.mark.skipif(
-    sys.platform != "win32", reason="host-specific default behaviour")
+@pytest.mark.skipif(sys.platform != "win32", reason="host-specific default behaviour")
 def test_host_platform_is_detected() -> None:
     assert build_config.host_platform() == "windows"
 
@@ -372,9 +405,9 @@ def test_release_tag_mismatch_is_rejected() -> None:
 @pytest.mark.parametrize(
     "tag",
     [
-        "0.1.2",  # exact version but missing the v prefix
-        "release-0.1.2",  # wrong prefix
-        "V0.1.2",  # tags are case-sensitive; only lowercase v is a tag
+        "0.1.3",  # exact version but missing the v prefix
+        "release-0.1.3",  # wrong prefix
+        "V0.1.3",  # tags are case-sensitive; only lowercase v is a tag
         "v",  # prefix with an empty version body
         "",  # not a tag at all
     ],
@@ -394,12 +427,17 @@ def test_release_workflow_guards_are_in_place() -> None:
     deliberately, the same way the other scope guards do.
     """
     text = (SOURCE_ROOT / ".github" / "workflows" / "build.yml").read_text(
-        encoding="utf-8")
+        encoding="utf-8"
+    )
     assert "    tags:\n      - 'v*'" in text
     assert "needs: [windows-installer, linux-archive]" in text
     assert "if: startsWith(github.ref, 'refs/tags/v')" in text
     assert "--verify-tag" in text
     assert text.count("contents: write") == 1
-    assert text.count(
-        "if: github.event_name == 'workflow_dispatch'"
-        " || startsWith(github.ref, 'refs/tags/v')") == 2
+    assert (
+        text.count(
+            "if: github.event_name == 'workflow_dispatch'"
+            " || startsWith(github.ref, 'refs/tags/v')"
+        )
+        == 2
+    )
