@@ -15,9 +15,12 @@ downloads/
 eggs/
 .eggs/
 lib/
+.cloud-attachments/
 lib64/
 parts/
 sdist/
+.github/
+.freebuff/
 var/
 wheels/
 share/python-wheels/

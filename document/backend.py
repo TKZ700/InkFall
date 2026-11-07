@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import shutil
 import tempfile
 import time
 from queue import Empty
@@ -148,6 +149,18 @@ class PdfBackend:
         # Snapshot file backing the live handle after a same-path save
         # (see export_pdf). Deleted when the handle it backs is closed.
         self._snapshot_pending: str | None = None
+        # Private working copy the live handle is opened from and saved
+        # back to incrementally. The user's source file is never written
+        # by an in-memory edit; it only changes through a verified export.
+        self._work_path: str | None = None
+        # Working copies retired by a same-path save's handle handoff.
+        # They may still back the renderer, so they are deleted with the
+        # handle rather than under a live pipeline.
+        self._retired: list[str] = []
+        # Page-edit appends since the last compacting export. Incremental
+        # saves never garbage-collect, so this bounds how much dead object
+        # data a long editing session accumulates before a save reclaims it.
+        self._appends_since_compaction = 0
         # Snapshot scalar header state at open time so basic accessors do
         # not need to touch pages. len() reads the trailer (O(1)).
         try:
@@ -188,7 +201,13 @@ class PdfBackend:
                 if not ok:
                     doc.close()
                     raise WrongPasswordError(f"Incorrect password for PDF: {path}")
-            return cls(doc, path, DocumentId(), encrypted_at_open, password)
+            backend = cls(doc, path, DocumentId(), encrypted_at_open, password)
+            try:
+                backend._ensure_work_copy()
+            except Exception:
+                backend.close()
+                raise
+            return backend
         except (EncryptedPdfError, WrongPasswordError, InvalidPdfError):
             raise
         except Exception as e:
@@ -209,6 +228,15 @@ class PdfBackend:
     def path(self) -> str:
         """Source path as passed to :meth:`open`."""
         return self._path
+
+    @property
+    def render_path(self) -> str:
+        """Private working copy the live handle reads and appends to.
+
+        Never the user's source file: page-edit saves are incremental
+        appends to this file, and the render pipeline reads it.
+        """
+        return self._work_path or self._path
 
     @property
     def is_closed(self) -> bool:
@@ -452,6 +480,111 @@ class PdfBackend:
                 f"Cannot insert blank page at {index}: {self._path} ({e})") from e
         self._page_count += 1
 
+    def materialize_work_copy(self) -> str:
+        """Append the live handle's changes to its working copy.
+
+        The handle owns a private file and was opened from it, which is
+        what lets PyMuPDF save incrementally here: only the objects a page
+        edit changed are appended instead of the whole document being
+        re-serialized into a new temp file. Returns the working copy path
+        the render pipeline should read.
+        """
+        self._ensure_open()
+        path = self._ensure_work_copy()
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None
+        try:
+            self._doc.save(path, incremental=True,
+                           encryption=_PDF_ENCRYPT_KEEP)
+        except Exception as e:
+            # An incremental save appends in place, so a failed write must
+            # not leave a partial trailer on the file the handle reads.
+            _truncate_work_copy(path, size)
+            raise InvalidPdfError(
+                f"Cannot write working copy: {e}") from e
+        self._appends_since_compaction += 1
+        return path
+
+    def _needs_compaction(self) -> bool:
+        """True when the next export must compact instead of appending.
+
+        Appending never garbage-collects, so every page edit leaves dead
+        objects behind in the working copy. After enough of them the next
+        save takes the compacting rewrite, which reclaims that space
+        instead of letting a long editing session grow the file without
+        bound.
+        """
+        return self._appends_since_compaction >= _INCREMENTAL_COMPACT_AFTER
+
+    def _note_export_mode(self, compacted: bool) -> None:
+        """Record whether the last export compacted or appended."""
+        if compacted:
+            self._appends_since_compaction = 0
+
+    def _ensure_work_copy(self) -> str:
+        """Open the live handle on a private working copy (once).
+
+        A file-backed source is copied byte for byte, so encryption,
+        structure and metadata survive untouched; an in-memory document is
+        written once. The handle is then reopened from that copy, because
+        PyMuPDF only appends incrementally to the file a handle was opened
+        from. The source file itself is never modified.
+        """
+        if self._work_path:
+            return self._work_path
+        fd, path = tempfile.mkstemp(prefix="inkfall-live-", suffix=".pdf")
+        os.close(fd)
+        doc = None
+        source = self._path
+        try:
+            if source and os.path.isfile(source):
+                shutil.copyfile(source, path)
+            else:
+                self._doc.save(path, encryption=_PDF_ENCRYPT_KEEP)
+            doc = pymupdf.open(path)
+            if doc.needs_pass:
+                password = self._password
+                if not password or not doc.authenticate(password):
+                    raise EncryptedPdfError(
+                        f"Encrypted PDF requires a password: {source}")
+        except Exception as e:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            if isinstance(e, InvalidPdfError):
+                raise
+            raise InvalidPdfError(
+                f"Cannot prepare a working copy: {source} ({e})") from e
+        old_doc, self._doc = self._doc, doc
+        self._work_path = path
+        try:
+            old_doc.close()
+        except Exception:
+            pass
+        return path
+
+    def _adopt_work_copy(self, path: str) -> None:
+        """Make ``path`` the working copy backing the live handle.
+
+        A same-path export installs a replacement handle opened from the
+        export snapshot; that file now backs the live handle, so
+        incremental saves must target it. The previous working copy may
+        still back the renderer, so it is retired rather than deleted.
+        """
+        previous, self._work_path = self._work_path, path
+        self._snapshot_pending = path
+        if previous and previous != path and previous not in self._retired:
+            self._retired.append(previous)
+
     def save_copy(self, path: str) -> None:
         """Write the current in-memory document to a working file.
 
@@ -657,18 +790,10 @@ class PdfBackend:
             raise InvalidPdfError(
                 f"Cannot snapshot document for save: {e}") from e
 
-        holder = None
         replacement = None
         temp_path = None
+        protect_output = False
         try:
-            holder, holder_protected = self._open_snapshot(snapshot_path)
-            if self._encrypted_at_open and not holder_protected:
-                raise EncryptedRewriteError(
-                    "The exported copy of this encrypted PDF would lose its "
-                    "protection. The save was refused and the original file "
-                    "is unchanged.")
-            protect_output = bool(holder_protected)
-
             target_abs = os.path.abspath(os.path.expanduser(target_path))
             target_dir = os.path.dirname(target_abs) or "."
             try:
@@ -680,43 +805,16 @@ class PdfBackend:
                 raise InvalidPdfError(
                     f"Cannot prepare save directory: {e}") from e
 
-            try:
-                original_attachments = tuple(holder.embfile_names() or ())
-            except Exception:
-                original_attachments = ()
-
-            _emit_progress(progress, "annotations")
-            expected_markers = _apply_export_annotations(
-                holder, native_pages)
-
-            _write_manifest_attachment(holder, manifest_bytes)
-
-            try:
-                fd, temp_path = tempfile.mkstemp(
-                    prefix=".inkfall-save-", suffix=".pdf", dir=target_dir)
-            except Exception as e:
-                if _is_destination_lock_error(e):
-                    raise SaveLockedError(
-                        _unwritable_message(target_abs, e)) from e
-                raise
-            os.close(fd)
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-            try:
-                _emit_progress(progress, "write")
-                holder.save(temp_path, garbage=3, deflate=True,
-                            encryption=_PDF_ENCRYPT_KEEP)
-            except Exception as exc:
-                text = str(exc).lower()
-                if self._encrypted_at_open and (
-                        "encrypt" in text or "password" in text):
-                    raise EncryptedRewriteError(
-                        _ENCRYPTED_REWRITE_MESSAGE) from exc
-                raise
-            holder.close()
-            holder = None
+            export = _export_annotated_copy(
+                snapshot_path, target_dir, target_abs, native_pages,
+                manifest_bytes, self._password,
+                encrypted_at_open=bool(self._encrypted_at_open),
+                compact=self._needs_compaction(), progress=progress)
+            temp_path = export["temp"]
+            protect_output = bool(export["protected"])
+            expected_markers = export["markers"]
+            original_attachments = export["attachments"]
+            self._note_export_mode(bool(export["compacted"]))
 
             expected_permissions = None
             if protect_output:
@@ -762,13 +860,11 @@ class PdfBackend:
                 except Exception:
                     self._doc = replacement
                     replacement = None
-                    self._snapshot_pending = snapshot_path
+                    self._adopt_work_copy(snapshot_path)
                     raise
                 self._doc = replacement
                 replacement = None
-                # The live handle now reads lazily from the snapshot file;
-                # it is deleted when the handle it backs closes (close()).
-                self._snapshot_pending = snapshot_path
+                self._adopt_work_copy(snapshot_path)
             else:
                 _emit_progress(progress, "replace")
                 _replace_target(temp_path, target_abs)
@@ -780,11 +876,6 @@ class PdfBackend:
                 f"Cannot save PDF: {target_path} "
                 f"({type(e).__name__}: {e})") from e
         finally:
-            if holder is not None:
-                try:
-                    holder.close()
-                except Exception:
-                    pass
             if replacement is not None:
                 try:
                     replacement.close()
@@ -801,7 +892,7 @@ class PdfBackend:
                 # installed must leave a usable live handle.
                 try:
                     self._doc, _protected = self._open_snapshot(snapshot_path)
-                    self._snapshot_pending = snapshot_path
+                    self._adopt_work_copy(snapshot_path)
                 except Exception:
                     self._closed = True
             if self._snapshot_pending != snapshot_path:
@@ -908,6 +999,7 @@ class PdfBackend:
             "password": self._password,
             "encrypted_at_open": bool(self._encrypted_at_open),
             "permissions": expected_permissions,
+            "compact": self._needs_compaction(),
         }
 
         temp_path = None
@@ -952,10 +1044,11 @@ class PdfBackend:
             _emit_progress(progress, "replace")
             _replace_target(temp_path, target_abs)
             temp_path = None
+            self._note_export_mode(bool(result.get("compacted")))
             if same_target:
                 replacement, _protected = self._open_snapshot(snapshot_path)
                 self._doc = replacement
-                self._snapshot_pending = snapshot_path
+                self._adopt_work_copy(snapshot_path)
                 snapshot_pending = True
         except InvalidPdfError:
             raise
@@ -974,7 +1067,7 @@ class PdfBackend:
                 # A same-path failure must leave a usable live handle.
                 try:
                     self._doc, _protected = self._open_snapshot(snapshot_path)
-                    self._snapshot_pending = snapshot_path
+                    self._adopt_work_copy(snapshot_path)
                     snapshot_pending = True
                 except Exception:
                     self._closed = True
@@ -1081,6 +1174,18 @@ class PdfBackend:
                     os.remove(snapshot)
             except Exception:
                 pass
+        # The owned working copy and every retired handoff copy are gone
+        # with the handle that read them.
+        work, self._work_path = self._work_path, None
+        retired, self._retired = self._retired, []
+        for stale in [work, *retired]:
+            if not stale or stale == snapshot:
+                continue
+            try:
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            except Exception:
+                pass
 
     def _ensure_open(self) -> None:
         if self._closed or self._doc is None:
@@ -1091,6 +1196,23 @@ class PdfBackend:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _truncate_work_copy(path: str, size: int | None) -> None:
+    """Drop a half-appended incremental save (best effort, never raises).
+
+    The working copy is appended to in place, so the previous file length
+    is the only durable point to fall back to: cutting the file back to it
+    leaves the last complete xref intact for the live handle and the
+    render workers.
+    """
+    if size is None:
+        return
+    try:
+        with open(path, "r+b") as handle:
+            handle.truncate(size)
+    except Exception:
+        pass
 
 
 def _serialize_page(handle, index: int) -> bytes:
@@ -1169,6 +1291,14 @@ def _unwritable_message(target_abs: str, exc: BaseException) -> str:
 #: errno values that mean the destination (file or its directory) cannot
 #: be written: access denied, permission problem, read-only filesystem,
 #: or a resource temporarily held by another handle.
+#: Page-edit appends allowed before an export compacts the file again.
+#: Incremental appends never garbage-collect, so this caps how much dead
+#: object data a long editing session can accumulate before a save reclaims
+#: it (25 edits is far below the point where a file looks bloated, and the
+#: compacting save stays rare enough to be unnoticeable).
+_INCREMENTAL_COMPACT_AFTER = 25
+
+
 _DESTINATION_LOCK_ERRNO = frozenset(
     {errno.EACCES, errno.EPERM, errno.EROFS, errno.EBUSY})
 
@@ -1269,12 +1399,128 @@ def _apply_export_annotations(holder, native_pages: list) -> dict:
     return expected_markers
 
 
+def _copy_beside(snapshot_path: str, target_dir: str, target_abs: str) -> str:
+    """Byte-copy the export snapshot next to the destination.
+
+    A plain file copy, not a PyMuPDF save: the copy is reopened from disk
+    so the annotation pass can append to it incrementally, and PyMuPDF only
+    allows an incremental save into the handle's own file. The copy lives
+    beside the destination so the parent's ``os.replace`` stays on one
+    volume. Destination lock failures are classified here so the child can
+    report them without the parent having to re-derive them.
+    """
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".inkfall-save-", suffix=".pdf", dir=target_dir)
+    except Exception as e:
+        if _is_destination_lock_error(e):
+            raise SaveLockedError(_unwritable_message(target_abs, e)) from e
+        raise
+    os.close(fd)
+    try:
+        shutil.copyfile(snapshot_path, temp_path)
+    except Exception as e:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        if _is_destination_lock_error(e):
+            raise SaveLockedError(_unwritable_message(target_abs, e)) from e
+        raise
+    return temp_path
+
+
+def _export_annotated_copy(snapshot_path: str, target_dir: str,
+                           target_abs: str, native_pages, manifest_bytes,
+                           password: str | None, *, encrypted_at_open: bool,
+                           compact: bool = False, progress=None) -> dict:
+    """Build the export body as a copy of the snapshot plus one increment.
+
+    The previous implementation re-serialized the entire document with
+    ``garbage=3, deflate=True`` on every save (62 s on a 21 MB / 274 page
+    file). Instead the snapshot is byte-copied, opened from disk, given its
+    native annotations and manifest, and saved with ``incremental=True``: 
+    only the annotation objects, their appearance streams, the attachment
+    and the new xref section are appended (0.13 s for the same file).
+
+    ``compact`` forces the old full rewrite, which is also the fallback
+    when the library refuses an incremental save (repaired files, an
+    encryption nuance): the rewrite garbage-collects the object data that
+    earlier appends left behind.
+
+    Returns ``{"temp", "markers", "protected", "attachments",
+    "compacted"}``. The temp file is removed here on failure; on success
+    the caller owns it and passes it to ``_replace_target``.
+    """
+    temp_path = _copy_beside(snapshot_path, target_dir, target_abs)
+    holder = None
+    try:
+        holder, protected = _open_export_snapshot(temp_path, password)
+        if encrypted_at_open and not protected:
+            raise EncryptedRewriteError(
+                "The exported copy of this encrypted PDF would lose its "
+                "protection. The save was refused and the original file "
+                "is unchanged.")
+        try:
+            attachments = tuple(holder.embfile_names() or ())
+        except Exception:
+            attachments = ()
+        _emit_progress(progress, "annotations")
+        markers = _apply_export_annotations(holder, native_pages)
+        _write_manifest_attachment(holder, manifest_bytes)
+        compacted = bool(compact)
+        if not compacted:
+            _emit_progress(progress, "write")
+            try:
+                holder.save(temp_path, incremental=True,
+                            encryption=_PDF_ENCRYPT_KEEP)
+            except Exception as exc:
+                text = str(exc).lower()
+                if encrypted_at_open and (
+                        "encrypt" in text or "password" in text):
+                    raise EncryptedRewriteError(
+                        _ENCRYPTED_REWRITE_MESSAGE) from exc
+                compacted = True
+        if compacted:
+            # Rewrite into a different file: a non-incremental save into
+            # the handle's own file is refused by the library, and the copy
+            # may already hold a partial increment.
+            _emit_progress(progress, "write")
+            compact_path = _write_export_temp(
+                holder, target_dir, target_abs)
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            temp_path = compact_path
+        return {"temp": temp_path, "markers": markers,
+                "protected": protected, "attachments": attachments,
+                "compacted": compacted}
+    except Exception:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        raise
+    finally:
+        if holder is not None:
+            try:
+                holder.close()
+            except Exception:
+                pass
+
+
 def _write_export_temp(holder, target_dir: str, target_abs: str) -> str:
     """Write the annotated holder to a private temp file in ``target_dir``.
 
-    Kept beside the destination so the parent's ``os.replace`` stays on
-    one volume. Destination lock failures are classified here so the
-    child can report them without the parent having to re-derive them.
+    The compacting writer: a full ``garbage=3, deflate=True`` rewrite used
+    for the periodic compaction and as the fallback when an incremental
+    save is refused. Kept beside the destination so the parent's
+    ``os.replace`` stays on one volume. Destination lock failures are
+    classified here so the child can report them without the parent having
+    to re-derive them.
     """
     try:
         fd, temp_path = tempfile.mkstemp(
@@ -1350,51 +1596,30 @@ def _export_child_main(job: dict, result_queue) -> None:
         # child blocked on its result queue (Windows: job object).
         install_child_guard()
         t0 = time.perf_counter()
-        holder, protected = _open_export_snapshot(
-            job["snapshot"], job.get("password"))
-        timings["open_s"] = round(time.perf_counter() - t0, 3)
-        if job["encrypted_at_open"] and not protected:
-            raise EncryptedRewriteError(
-                "The exported copy of this encrypted PDF would lose its "
-                "protection. The save was refused and the original file "
-                "is unchanged.")
-        result_queue.put(("stage", "annotations"))
-        t0 = time.perf_counter()
-        try:
-            original_attachments = tuple(holder.embfile_names() or ())
-        except Exception:
-            original_attachments = ()
-        markers = _apply_export_annotations(holder, job["native_pages"])
-        _write_manifest_attachment(holder, job["manifest"])
-        timings["annotations_s"] = round(time.perf_counter() - t0, 3)
-        result_queue.put(("stage", "write"))
-        t0 = time.perf_counter()
-        try:
-            temp_path = _write_export_temp(
-                holder, job["target_dir"], job["target"])
-        except Exception as exc:
-            text = str(exc).lower()
-            if job["encrypted_at_open"] and (
-                    "encrypt" in text or "password" in text):
-                raise EncryptedRewriteError(
-                    _ENCRYPTED_REWRITE_MESSAGE) from exc
-            raise
+        export = _export_annotated_copy(
+            job["snapshot"], job["target_dir"], job["target"],
+            job["native_pages"], job["manifest"], job.get("password"),
+            encrypted_at_open=bool(job.get("encrypted_at_open")),
+            compact=bool(job.get("compact")),
+            progress=lambda stage: result_queue.put(("stage", stage)))
+        temp_path = export["temp"]
+        protected = bool(export["protected"])
         timings["write_s"] = round(time.perf_counter() - t0, 3)
-        holder.close()
-        holder = None
         result_queue.put(("stage", "verify"))
         t0 = time.perf_counter()
         _verify_saved_pdf(
             temp_path, job["page_count"], job["manifest"],
-            job["paper_keywords"], original_attachments,
-            expected_markers=markers,
+            job["paper_keywords"], export["attachments"],
+            expected_markers=export["markers"],
             password=job.get("password") if protected else None,
             expect_encrypted=protected,
             expected_permissions=(job.get("permissions")
                                   if protected else None))
         timings["verify_s"] = round(time.perf_counter() - t0, 3)
         result_queue.put(
-            ("done", {"ok": True, "temp": temp_path, "timings": timings}))
+            ("done", {"ok": True, "temp": temp_path,
+                      "compacted": bool(export["compacted"]),
+                      "timings": timings}))
         temp_path = None
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         result_queue.put(("done", {
@@ -1424,6 +1649,7 @@ def _poll_export_process(proc, result_queue) -> tuple[bool, dict]:
     A child that exits without reporting is a hard failure, never a lock.
     """
     stage = None
+    stages: list[str] = []
     while True:
         try:
             kind, value = result_queue.get_nowait()
@@ -1433,7 +1659,14 @@ def _poll_export_process(proc, result_queue) -> tuple[bool, dict]:
             break
         if kind == "stage":
             stage = value
+            stages.append(value)
         elif kind == "done":
+            # Carry every stage name along with the result: a fast save
+            # reports several of them between two polls, and the UI (and
+            # the save diagnostics) should not lose any.
+            if stages and isinstance(value, dict):
+                value = dict(value)
+                value.setdefault("stages", stages)
             return True, value
     if not proc.is_alive():
         # The feeder can flush just after the process exits.
@@ -2092,7 +2325,13 @@ def create_blank_backend(spec: PaperSpec, path: str) -> PdfBackend:
             })
         except Exception:
             pass
-        return PdfBackend(doc, path, DocumentId())
+        backend = PdfBackend(doc, path, DocumentId())
+        try:
+            backend._ensure_work_copy()
+        except Exception:
+            backend.close()
+            raise
+        return backend
     except Exception as e:
         try:
             doc.close()

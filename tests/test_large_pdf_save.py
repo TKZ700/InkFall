@@ -440,17 +440,24 @@ def _pumping_pump(stages: list | None = None, done_payload: dict | None = None):
 
 
 def _work_copy_prefix(path: str) -> bool:
-    return os.path.basename(path).startswith("inkfall-work-")
+    """True for a private working copy owned by a live handle.
+
+    The handle is opened on a byte copy of the source and saves back to it
+    incrementally, so the render path (and every borrowed export input) is
+    such a copy.
+    """
+    return os.path.basename(path).startswith(("inkfall-work-",
+                                              "inkfall-live-"))
 
 
 def test_same_path_save_borrows_the_render_work_copy(tmp_path: Path) -> None:
     """A same-path save exports from the work copy, never a second write.
 
-    After prepare_for_save materializes the sanitized working copy, the
-    export input IS that file: the backend's pending snapshot (the file
-    backing the replacement handle) must be the borrowed work copy, no
-    fresh inkfall-snapshot temp may appear, and the document must stay
-    fully usable and export correctly.
+    The live handle already owns its working copy, so the export input IS
+    that file: the backend's pending snapshot (the file backing the
+    replacement handle) must be the borrowed work copy, no fresh
+    inkfall-snapshot temp may appear, and the document must stay fully
+    usable and export correctly.
     """
     pdf = make_pdf(str(tmp_path / "borrow.pdf"), pages=3)
     baseline = _snapshots_in_temp()
@@ -471,7 +478,8 @@ def test_same_path_save_borrows_the_render_work_copy(tmp_path: Path) -> None:
     assert os.path.isfile(backend.pending_snapshot)
     assert not (_snapshots_in_temp() - baseline), (
         "a borrowed-work-copy save must not create snapshot temp files")
-    assert "verify" in stages
+    reported = list(stages) + list(done_payload.get("stages") or ())
+    assert "verify" in reported, "the child must report its verify stage"
     assert done_payload.get("ok") is True
     assert "write_s" in (done_payload.get("timings") or {}), (
         "the child must report per-stage timings for diagnostics")
@@ -487,30 +495,32 @@ def test_same_path_save_borrows_the_render_work_copy(tmp_path: Path) -> None:
         "close() must retire the borrowed snapshot")
 
 
-def test_save_as_borrows_when_materialized_and_falls_back_otherwise(
-        tmp_path: Path) -> None:
-    """Save As borrows a current work copy; a fresh doc writes its own."""
+def test_save_as_borrows_the_work_copy(tmp_path: Path) -> None:
+    """Save As exports from the working copy and never touches the source."""
     pdf = make_pdf(str(tmp_path / "fresh.pdf"), pages=2)
     original_bytes = Path(pdf).read_bytes()
     baseline = _snapshots_in_temp()
 
-    # Freshly opened, nothing stripped: renderer still reads the source,
-    # so there is no work copy to borrow and the backend writes its own
-    # snapshot (then deletes it — a Save As never keeps one).
+    # The handle is opened on its own working copy, so even a freshly
+    # opened document exports from that copy instead of writing a second
+    # full serialization of identical content first.
     doc = _open_doc(pdf)
-    assert doc._export_snapshot_candidate() is None
+    candidate = doc._export_snapshot_candidate()
+    assert candidate is not None and _work_copy_prefix(candidate)
     copy_path = str(tmp_path / "as-copy.pdf")
     doc.write_export(copy_path, pump=_pumping_pump())
     assert doc._backend.pending_snapshot is None, (
         "a non-same-path save must not pin a pending snapshot")
     assert Path(copy_path).is_file()
     assert Path(pdf).read_bytes() == original_bytes
+    assert os.path.isfile(candidate), (
+        "a borrowed file must survive a Save As as the render work copy")
     doc.close()
     assert not (_snapshots_in_temp() - baseline), (
-        "the fallback snapshot of a Save As must be deleted afterwards")
+        "a borrowed-work-copy save must not create snapshot temp files")
 
-    # A document whose renderer is on a work copy (page op materialized)
-    # borrows that copy even for Save As, and it stays a work copy.
+    # A page edit keeps the same contract: the edit appends to the working
+    # copy and Save As still borrows it.
     pdf2 = make_pdf(str(tmp_path / "op.pdf"), pages=2)
     doc2 = _open_doc(pdf2)
     doc2.rotate_page(0, 90)
@@ -558,7 +568,7 @@ def test_backend_export_falls_back_when_borrow_path_is_unusable(
 
 
 def test_prune_keeps_the_pending_snapshot_alive(tmp_path: Path) -> None:
-    """A borrowed snapshot outlives work-copy pruning until it is retired."""
+    """The borrowed backing file outlives a page op until it is retired."""
     pdf = make_pdf(str(tmp_path / "prune.pdf"), pages=2)
     doc = _open_doc(pdf)
     doc.prepare_for_save(pdf)
@@ -566,20 +576,23 @@ def test_prune_keeps_the_pending_snapshot_alive(tmp_path: Path) -> None:
     borrowed = doc._backend.pending_snapshot
     assert borrowed is not None and _work_copy_prefix(borrowed)
 
-    # A page op materializes a new work copy; the pruning that follows
-    # must keep the file that backs the live handle.
+    # A page op appends to that same working copy: the file backing the
+    # live handle must still be there afterwards.
     doc.rotate_page(0, 90)
     assert os.path.isfile(borrowed), (
-        "materialize pruning deleted the pending snapshot backing the "
+        "materializing a page op deleted the pending snapshot backing the "
         "live handle")
     assert doc.page_count == 2
 
-    # The next same-path save retires it: the handle closed before the
-    # replacement, so the old backing file may finally vanish.
+    # The next same-path save borrows that same file again: one working
+    # copy serves the whole session, and close() retires it.
     doc.write_export(pdf, pump=_pumping_pump())
-    assert not os.path.isfile(borrowed)
-    assert doc._backend.pending_snapshot != borrowed
+    assert doc._backend.pending_snapshot == borrowed, (
+        "repeated same-path saves must append to one working copy")
+    assert os.path.isfile(borrowed)
     doc.close()
+    assert not os.path.isfile(borrowed), (
+        "close() must retire every working copy the handle owned")
 
 
 def test_failed_same_path_save_with_borrow_keeps_session_usable(

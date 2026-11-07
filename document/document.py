@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import tempfile
 
 from core.types import DocumentId, PageId
 from annotations.models import (
@@ -366,14 +365,12 @@ class Document:
         # on close so abandoned documents keep nothing alive.
         self._annotations = AnnotationStore(
             page_count=backend.page_count)
-        # M6.8.2 Stage 5.1: the render pipeline reads from a *path*, so
-        # an in-memory page edit is only visible to it through a working
-        # copy. ``_render_path`` starts at the original and is repointed
-        # at a temp file after the first page edit; the original file on
-        # disk is never written.
-        self._render_path = (str(backend.path) if not self._unsaved
-                             else normalized_path)
-        self._work_paths: list[str] = []
+        # M6.8.2 Stage 5.1: the render pipeline reads from a *path*. The
+        # backend keeps the live handle on a private working copy it can
+        # append to incrementally, so ``_render_path`` is that file from
+        # the start and is never the user's original; the original file
+        # on disk is only written by a verified export.
+        self._render_path = str(backend.render_path)
 
     @property
     def annotations(self) -> AnnotationStore:
@@ -663,10 +660,10 @@ class Document:
         # Refuse an encrypted source that cannot be rewritten with its
         # protection intact before any temp file or replacement work.
         self._backend.ensure_export_supported()
-        if not self._is_source_target(target_path) or not self._render_is_source():
-            return False
-        self._materialize()
-        return True
+        # The renderer already reads the handle's private working copy, so
+        # a same-path save never has to detach it from the source file and
+        # the render path does not change: no rebind is needed.
+        return False
 
     def ensure_render_file(self) -> str:
         """Materialize the initial working copy for an unsaved blank.
@@ -749,6 +746,9 @@ class Document:
             self._backend.export_pdf(
                 target_path, native_pages, manifest_bytes, self.page_count,
                 paper_keywords, progress=progress)
+        # A same-path save can hand the live handle to the export snapshot
+        # file; follow it so the renderer never reads a retired copy.
+        self._render_path = str(self._backend.render_path)
 
     @property
     def id(self) -> DocumentId:
@@ -988,51 +988,15 @@ class Document:
                     continue
 
     def _materialize(self) -> None:
-        """Write the in-memory document to a fresh working copy.
+        """Append the in-memory page state to the handle's working copy.
 
-        The render pipeline reads from a path; a fresh, unique temp path
-        per edit guarantees no conflict with a still-open previous
-        handle. Older working copies are pruned best-effort here (the
-        caller releases the previous pipeline before calling a page
-        operation) and again on close.
+        The live handle owns one private working copy, so PyMuPDF saves
+        incrementally: only the objects a page edit changed are appended,
+        instead of the whole document being re-serialized into a new temp
+        file. The render path stays put; the viewer rebuilds its pipeline
+        around each page operation.
         """
-        handle, path = tempfile.mkstemp(prefix="inkfall-work-",
-                                        suffix=".pdf")
-        os.close(handle)
-        try:
-            self._backend.save_copy(path)
-        except Exception:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-            raise
-        previous = self._render_path
-        self._work_paths.append(path)
-        self._render_path = path
-        self._prune_work_files(keep=path)
-
-    def _prune_work_files(self, keep: str | None = None) -> None:
-        try:
-            protected = self._backend.pending_snapshot
-        except Exception:
-            protected = None
-        remaining = []
-        for path in self._work_paths:
-            if path == keep or (protected is not None and path == protected):
-                # ``keep`` backs the renderer; a pending snapshot backs
-                # the live handle after a save. Neither may vanish here.
-                remaining.append(path)
-                continue
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                # Already retired elsewhere (e.g. the next same-path save
-                # deletes its borrowed predecessor): drop the stale entry.
-                continue
-            except Exception:
-                remaining.append(path)
-        self._work_paths = remaining
+        self._render_path = self._backend.materialize_work_copy()
 
     def info(self) -> DocumentInfo:
         """Snapshot descriptor for this document."""
@@ -1059,9 +1023,5 @@ class Document:
             self._annotations.clear()
         except Exception:
             pass
-        try:
-            self._prune_work_files(keep=None)
-            self._render_path = self._normalized_path
-        except Exception:
-            pass
+        self._render_path = self._normalized_path
         self._backend.close()

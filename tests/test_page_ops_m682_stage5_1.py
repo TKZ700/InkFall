@@ -517,10 +517,11 @@ def test_repeated_deletes_keep_page_ids_consistent(tmp_path):
 
 def _fail_save(monkeypatch, document):
     """Make the working-copy write raise, as a disk/lock fault would."""
-    def boom(_self, _target):  # patched method on the PdfBackend class
+    def boom(_self):  # patched method on the PdfBackend class
         raise RuntimeError("simulated working-copy write failure")
 
-    monkeypatch.setattr(type(document._backend), "save_copy", boom)
+    monkeypatch.setattr(type(document._backend), "materialize_work_copy",
+                        boom)
 
 
 def test_rotate_page_rolls_back_when_the_copy_cannot_be_written(
@@ -530,7 +531,6 @@ def test_rotate_page_rolls_back_when_the_copy_cannot_be_written(
     try:
         stroke = _seed(document, 0, 100.0, 100.0)
         before_render = document.render_path
-        before_work = list(document._work_paths)
         _fail_save(monkeypatch, document)
         with pytest.raises(RuntimeError):
             document.rotate_page(0, 90)
@@ -540,7 +540,6 @@ def test_rotate_page_rolls_back_when_the_copy_cannot_be_written(
         assert _point_close(document.annotations.get(stroke.id).points[0],
                             (100.0, 100.0))
         assert document.render_path == before_render
-        assert document._work_paths == before_work
         assert document.page_count == 1
     finally:
         document.close()

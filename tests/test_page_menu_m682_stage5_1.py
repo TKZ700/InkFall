@@ -718,10 +718,11 @@ def test_failed_page_write_leaves_no_history_and_no_mutation(
                                    sizes=[(400.0, 300.0), (400.0, 300.0)])
     a = _seed(viewer, _pen_stroke(), page_index=0)
 
-    def boom(_self, _target):
+    def boom(_self):
         raise RuntimeError("simulated working-copy write failure")
 
-    monkeypatch.setattr(type(viewer._document._backend), "save_copy", boom)
+    monkeypatch.setattr(type(viewer._document._backend),
+                        "materialize_work_copy", boom)
 
     assert viewer._rotate_page(0, 90, "Rotate Page Clockwise") is False
     assert viewer._delete_page(1, "Delete Page") is False
